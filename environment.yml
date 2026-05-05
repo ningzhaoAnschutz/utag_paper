@@ -1,0 +1,79 @@
+# Environment for utag_paper analysis repository
+# Creates/updates the 'microlive' conda environment with all required dependencies.
+#
+# Usage:
+#   conda env create -f environment.yml        # first time
+#   conda env update -f environment.yml        # update existing
+#   conda activate microlive
+#
+# After activation, also install the companion libraries in dev mode:
+#   pip install -e /path/to/microlive           # microscopy analysis engine
+#   pip install -e /path/to/tasep_models        # TASEP simulation engine
+
+name: microlive
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+channel_priority: strict
+
+dependencies:
+  # Core
+  - python>=3.10
+  - numpy=1.26.4
+  - scipy>=1.15
+  - pandas>=2.2
+  - matplotlib>=3.10
+  - seaborn>=0.13
+  - scikit-image>=0.23
+  - scikit-learn>=1.6
+  - tqdm
+  - joblib
+  - psutil
+
+  # Imaging / IO
+  - tifffile
+  - imageio
+  - imagecodecs
+  - opencv
+  - pillow
+  - readlif>=0.6.5
+  - lxml
+
+  # Analysis
+  - trackpy>=0.6
+  - statsmodels>=0.14
+  - numba>=0.60
+  - llvmlite>=0.43
+  - dask
+  - biopython
+
+  # Jupyter
+  - ipykernel
+  - ipympl
+  - ipywidgets
+
+  # GUI
+  - pyqt=5.15.*
+
+  # Deep learning
+  - cellpose>=3.1
+  - fastremap
+  - pytorch>=2.4
+  - torchvision>=0.19
+  - cpuonly
+
+  # pip-only packages
+  - pip
+  - pip:
+      - microlive              # or: -e /path/to/microlive
+      - tasep-models           # or: -e /path/to/tasep_models
+      - big-fish>=0.6.2
+      - brokenaxes>=0.6.2
+      - dna_features_viewer>=3.1.3
+      - joypy>=0.2.6
+      - matplotlib-scalebar>=0.8.1
+      - mrc>=0.3.1
+      - openpyxl>=3.1.5
+      - pystackreg>=0.2.7
+      - snapgene_reader>=0.1.21
