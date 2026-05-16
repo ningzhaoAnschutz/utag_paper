@@ -128,10 +128,27 @@ pip install -e /path/to/tasep_models
 
 ---
 
+## Microscopy Data
+
+Live-cell confocal microscopy images used in this study are publicly available on Zenodo:
+
+> **Download:** [https://doi.org/10.5281/zenodo.19925202](https://doi.org/10.5281/zenodo.19925202)
+
+The dataset (~13 GB uncompressed) contains 187 maximum-intensity z-projected OME-TIFF time-lapse files from U2-OS cells, organized into two directories:
+
+| Directory | Figures | Description |
+|-----------|---------|-------------|
+| `Fig_7_ACF/` | 7 F–I | Extended time-lapse recordings for temporal autocorrelation analysis |
+| `Fig_7_Harringtonine/` | 7 J–M | Harringtonine-treated cells for ribosome run-off kinetics |
+
+Each directory is subdivided by tagging system (UTag, UTag_CF, SunTag, AlfaTag) and experimental date. All images were acquired on a Leica Stellaris 5 confocal microscope (63× oil objective, 512 × 512 px, 16-bit, pixel size 129.89 nm).
+
+---
+
 ## Reproducing Figures
 
 1. Activate the `microlive` conda environment.
-2. Ensure raw microscopy data is present (contact the corresponding authors for data access).
+2. Download microscopy data from [Zenodo](https://doi.org/10.5281/zenodo.19925202) and place it in the expected data directory.
 3. Open the appropriate notebook from `notebooks/Figure_N/`.
 4. Run all cells — `src/imports.py` auto-configures paths and dependencies.
 5. FRAP nuclei segmentation models are auto-downloaded on first use via `microlive`.
