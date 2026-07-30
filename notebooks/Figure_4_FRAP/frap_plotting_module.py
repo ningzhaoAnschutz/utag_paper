@@ -18,6 +18,8 @@ Functions (Representative Images):
 Functions (Interpretation / Statistics):
     - downsample_to_5_seconds
     - plot_FRAP_trajectories
+    - save_t_half_source_data
+    - write_frap_source_data_readme
     - plot_t_half_box_swarm
     - plot_mean_trajectories_all
     - plot_box_swarm_final_values
@@ -465,12 +467,24 @@ def downsample_to_5_seconds(df):
 
 
 def plot_FRAP_trajectories(df_list, selected_dataset, results_folder,
-                           apply_min_max_normalization=True, display_cell_count=True):
+                           apply_min_max_normalization=True, display_cell_count=True,
+                           bleach_time=10, raw_data_folder=None, figure_panel=None,
+                           source_data_condition=None):
     """Plot individual FRAP recovery traces with mean trajectory and one-phase fit.
+
+    Per-cell half-times are fitted only to the post-bleach recovery interval,
+    with the bleach time shifted to t=0. When requested, export the individual
+    plotted trajectories and plotted time-point means.
 
     Returns:
         (total_number_cells, t_half_list): Cell count and per-cell t½ values.
     """
+    if raw_data_folder is not None and (
+        figure_panel is None or source_data_condition is None
+    ):
+        raise ValueError(
+            "figure_panel and source_data_condition are required for source-data export."
+        )
     plt.rcParams.update({'font.family': 'Arial', 'font.size': 14, 'axes.labelweight': 'normal'})
     if isinstance(df_list, pd.DataFrame):
         df_list = [df_list]
@@ -480,7 +494,7 @@ def plot_FRAP_trajectories(df_list, selected_dataset, results_folder,
 
     fig, ax = plt.subplots(figsize=(6, 4), facecolor='white')
     ax.set_facecolor('white')
-    all_data, t_half_list = [], []
+    all_data, source_data, t_half_list = [], [], []
     total_cells = 0
     col = 'mean_roi_frap'
 
@@ -495,19 +509,52 @@ def plot_FRAP_trajectories(df_list, selected_dataset, results_folder,
                 mn, mx = cell_data[col].min(), cell_data[col].max()
                 cell_data[col] = (cell_data[col] - mn) / (mx - mn) if mx > mn else 0.0
             try:
-                popt, _ = curve_fit(one_phase, cell_data['frame'].values,
-                    cell_data[col].values, p0=[0.1], bounds=(0, np.inf))
+                recovery_data = cell_data[cell_data['frame'] >= bleach_time]
+                recovery_time = recovery_data['frame'].values - bleach_time
+                popt, _ = curve_fit(one_phase, recovery_time,
+                    recovery_data[col].values, p0=[0.1], bounds=(0, np.inf))
                 t_half_list.append(np.log(2) / popt[0])
             except Exception:
                 t_half_list.append(np.nan)
             ax.plot(cell_data['frame'], cell_data[col], '-', color='dimgray', lw=0.5, alpha=0.2)
             all_data.append(cell_data[['frame', col]])
             total_cells += 1
+            if raw_data_folder is not None:
+                cell_source_data = cell_data[['frame', col]].rename(columns={
+                    'frame': 'time_s',
+                    col: 'normalized_mean_roi_intensity',
+                })
+                cell_source_data.insert(0, 'cell_id', f'cell_{total_cells:03d}')
+                cell_source_data.insert(0, 'condition', source_data_condition)
+                source_data.append(cell_source_data)
 
     if all_data:
         all_df = pd.concat(all_data, ignore_index=True)
-        mean_traj = all_df.groupby('frame')[col].mean().reset_index()
-        ax.plot(mean_traj['frame'], mean_traj[col], '-', color='green', lw=3, label='Mean Trajectory')
+        summary_data = all_df.groupby('frame')[col].agg(['mean', 'count']).reset_index()
+        ax.plot(
+            summary_data['frame'], summary_data['mean'], '-', color='green',
+            lw=3, label='Mean Trajectory',
+        )
+        if raw_data_folder is not None:
+            raw_data_folder.mkdir(parents=True, exist_ok=True)
+            source_data_df = pd.concat(source_data, ignore_index=True)
+            source_data_path = (
+                raw_data_folder /
+                f'Figure_{figure_panel}_{source_data_condition}_FRAP_individual_trajectories.csv'
+            )
+            source_data_df.to_csv(source_data_path, index=False)
+
+            summary_data = summary_data.rename(columns={
+                'frame': 'time_s',
+                'mean': 'mean_normalized_intensity',
+                'count': 'n_cells',
+            })
+            summary_data.insert(0, 'condition', source_data_condition)
+            summary_data_path = (
+                raw_data_folder /
+                f'Figure_{figure_panel}_{source_data_condition}_FRAP_timepoint_summary.csv'
+            )
+            summary_data.to_csv(summary_data_path, index=False)
 
     ax.set_xlabel("Time (s)", fontdict={'family': 'Arial', 'size': 20, 'color': 'black'})
     ax.set_ylabel("Normalized Intensity", fontdict={'family': 'Arial', 'size': 20, 'color': 'black'})
@@ -528,6 +575,122 @@ def plot_FRAP_trajectories(df_list, selected_dataset, results_folder,
     fig.savefig(fpath.with_suffix('.svg'), format='svg', bbox_inches='tight', pad_inches=0.1, transparent=True)
     plt.show()
     return total_cells, t_half_list
+
+
+def save_t_half_source_data(t_half_lists, conditions, raw_data_folder):
+    """Save the per-cell fitted half-times plotted in Figure 4H."""
+    if len(t_half_lists) != len(conditions):
+        raise ValueError("t_half_lists and conditions must have the same length.")
+    source_data = []
+    for condition, t_half_values in zip(conditions, t_half_lists):
+        condition_data = pd.DataFrame({
+            'condition': condition,
+            't_half_s': np.asarray(t_half_values),
+        }).dropna(subset=['t_half_s'])
+        source_data.append(condition_data)
+    source_data_df = pd.concat(source_data, ignore_index=True)
+    raw_data_folder.mkdir(parents=True, exist_ok=True)
+    source_data_path = raw_data_folder / 'Figure_4H_FRAP_t_half_individual_values.csv'
+    source_data_df.to_csv(source_data_path, index=False)
+    return source_data_df
+
+
+def write_frap_source_data_readme(raw_data_folder):
+    """Write the Figure 4 source-data dictionary and analysis definitions."""
+    readme_text = """# Figure 4 FRAP source data
+
+These files contain the processed numerical data used to generate the graphs in
+Figure 4A-H. They are figure source data, not unprocessed acquisition-level raw
+microscopy data. Files are regenerated from the in-memory data assembled from
+the experiment-level CSV files in `FRAP_quantification/`;
+`combined_FRAP_data.csv` is not read or required.
+
+## Condition labels
+
+| CSV label | Figure label |
+|---|---|
+| `UTag` | UTag |
+| `UTag_DeltaCys` | UTag(ΔCys), ΔCys |
+| `SunTag` | SunTag |
+| `ALFA_tag` | ALFA-tag, ALFA |
+| `HA` | HA |
+
+ASCII-only condition labels are used in every CSV to avoid encoding and naming
+inconsistencies.
+
+## Figure 4A-E: condition-specific FRAP trajectories
+
+Each panel has an individual-trajectory file and a time-point summary file.
+The individual files contain `condition`, anonymous `cell_id`, `time_s`, and
+`normalized_mean_roi_intensity`. Each value is the mean fluorescence intensity
+within one cell ROI at one time point after per-cell min-max normalization:
+`(value - cell minimum) / (cell maximum - cell minimum)`.
+
+The summary files contain `condition`, `time_s`,
+`mean_normalized_intensity`, and `n_cells`. The green line is the arithmetic
+mean across the available cells at each time point. Panels A-E display no error
+bars or error bands, so no variability column is included.
+
+| Panel | Condition | Individual rows | Cells |
+|---|---|---:|---:|
+| 4A | `UTag` | 7,000 | 50 |
+| 4B | `UTag_DeltaCys` | 6,160 | 44 |
+| 4C | `SunTag` | 7,980 | 57 |
+| 4D | `ALFA_tag` | 7,980 | 57 |
+| 4E | `HA` | 5,880 | 42 |
+
+## Figure 4F: combined FRAP trajectories
+
+`Figure_4F_FRAP_all_conditions_timepoint_summary.csv` contains `condition`,
+`time_s`, `mean_normalized_intensity`,
+`sample_sd_normalized_intensity`, and `n_cells`. The colored line is the
+arithmetic mean across cells and the shaded region is mean ± sample standard
+deviation (SD; pandas default `ddof=1`). It is not SEM.
+
+The existing Figure 4F plotting call repeats the recovery-drop quality check
+with a threshold of 0.8 on the prepared normalized trajectories. It retains
+49 UTag, 44 UTag_DeltaCys, 57 SunTag, 57 ALFA_tag, and 42 HA cells. This is why
+the UTag `n_cells` in panel F is 49 rather than the 50 used in panel A.
+
+## Figure 4G: recovered intensity
+
+`Figure_4G_FRAP_recovered_intensity_individual_values.csv` contains
+`condition` and `normalized_recovered_intensity`. Each row is one black dot:
+the final recorded normalized mean ROI intensity for one cell. Box medians,
+quartiles, whiskers, statistical tests, p-values, and significance labels are
+not included.
+
+## Figure 4H: recovery half-time
+
+`Figure_4H_FRAP_t_half_individual_values.csv` contains `condition` and
+`t_half_s`. Each row is one successfully fitted black dot. Fits use only the
+post-bleach interval, with the 10-second bleach point reset to t=0. The model is
+`I(t) = 1 - exp(-k*t)`, with the recovery plateau fixed at 1, and
+`t_half_s = ln(2) / k`. Box summaries and statistical-test results are not
+included.
+
+## Data preparation
+
+The initial notebook quality check retains trajectories whose fluorescence drop
+during the first 20 seconds is greater than 0.5. The files contain 250 cells
+from 15 experiment folders: 50 UTag from 3 folders, 44 UTag_DeltaCys from 3,
+57 SunTag from 4, 57 ALFA_tag from 2, and 42 HA from 3. Figure 4F has the
+additional filter described above.
+
+There are 140 time points per complete trajectory: 0-39 seconds in one-second
+increments, followed by 44-539 seconds in five-second increments. Optional
+downsampling is disabled. The final values in Figure 4G are at 539 seconds.
+
+Normalization divisions are guarded: a constant trajectory is assigned zero
+after normalization. The CSV exports are created from the same prepared values
+used by their corresponding plotting functions. The package contains no
+p-values, significance tests, box summaries, image-provenance fields, source
+image names, experiment identifiers, or replacement combined trajectory file.
+"""
+    raw_data_folder.mkdir(parents=True, exist_ok=True)
+    readme_path = raw_data_folder / 'README_source_data.md'
+    readme_path.write_text(readme_text, encoding='utf-8')
+    return readme_path
 
 
 def plot_t_half_box_swarm(t_half_lists, names, results_folder, figsize=(6, 4),
@@ -586,13 +749,15 @@ def plot_mean_trajectories_all(df, selected_datasets, results_folder,
                                 selected_field='mean_roi_frap',
                                 apply_quality_check=True, drop_threshold=0.2,
                                 fontsize=12, apply_min_max_normalization=True,
-                                fig_size=(6,4), use_sem=True):
-    """Plot normalized mean FRAP recovery curves for multiple datasets with SEM shading."""
+                                fig_size=(6,4), use_sem=True, raw_data_folder=None,
+                                condition_label_map=None):
+    """Plot normalized mean FRAP recovery curves with SD or SEM shading."""
     cmap = plt.get_cmap('tab20')
     color_map = {ds: cmap(i) for i, ds in enumerate(selected_datasets)}
 
     fig, ax = plt.subplots(figsize=fig_size)
     ax.set_facecolor('white')
+    source_data = []
     for ds in selected_datasets:
         df_ds = df[df['dataset_type'] == ds]
         if df_ds.empty:
@@ -620,6 +785,29 @@ def plot_mean_trajectories_all(df, selected_datasets, results_folder,
         c = color_map[ds]
         ax.plot(means.index, means.values, 'o-', color=c, lw=2, label=ds, markersize=3)
         ax.fill_between(means.index, means - errs, means + errs, color=c, alpha=0.1)
+        if raw_data_folder is not None:
+            if use_sem:
+                error_column = 'sem_normalized_intensity'
+            else:
+                error_column = 'sample_sd_normalized_intensity'
+            condition = condition_label_map.get(ds, ds) if condition_label_map else ds
+            condition_source_data = pd.DataFrame({
+                'condition': condition,
+                'time_s': means.index,
+                'mean_normalized_intensity': means.values,
+                error_column: errs.values,
+                'n_cells': all_cells.count(axis=1).values,
+            })
+            source_data.append(condition_source_data)
+
+    if raw_data_folder is not None and source_data:
+        raw_data_folder.mkdir(parents=True, exist_ok=True)
+        source_data_df = pd.concat(source_data, ignore_index=True)
+        source_data_path = (
+            raw_data_folder /
+            'Figure_4F_FRAP_all_conditions_timepoint_summary.csv'
+        )
+        source_data_df.to_csv(source_data_path, index=False)
 
     ax.set_ylim(-0.05, 1.5)
     for spine in ax.spines.values():
@@ -643,11 +831,30 @@ def plot_mean_trajectories_all(df, selected_datasets, results_folder,
 def plot_box_swarm_final_values(df, selected_field, results_folder, figsize=(6, 4),
                                  xlabel="Dataset Type", ylabel="Final Normalized Intensity",
                                  title="", y_min=None, y_max=None, swarm_color="black",
-                                 tick_size=16, show_stats=False):
+                                 tick_size=16, show_stats=False, raw_data_folder=None,
+                                 condition_label_map=None):
     """Boxplot + swarmplot of final-frame FRAP values per cell, with optional pairwise stats."""
     sns.set_style("ticks")
     order_categories = ['UTag', 'UTag($\\Delta$Cys)', 'SunTag', 'ALFA-tag', 'HA']
     final_df = df.loc[df.groupby('cell_id')['frame'].idxmax()].copy()
+    if raw_data_folder is not None:
+        source_data_df = final_df[['dataset_type', selected_field]].rename(columns={
+            'dataset_type': 'condition',
+            selected_field: 'normalized_recovered_intensity',
+        })
+        if condition_label_map:
+            source_data_df['condition'] = source_data_df['condition'].replace(
+                condition_label_map
+            )
+        source_data_df = source_data_df[
+            ['condition', 'normalized_recovered_intensity']
+        ]
+        raw_data_folder.mkdir(parents=True, exist_ok=True)
+        source_data_path = (
+            raw_data_folder /
+            'Figure_4G_FRAP_recovered_intensity_individual_values.csv'
+        )
+        source_data_df.to_csv(source_data_path, index=False)
 
     fig, ax = plt.subplots(figsize=figsize, facecolor='white')
     sns.boxplot(x="dataset_type", y=selected_field, data=final_df,
