@@ -26,6 +26,7 @@ mask_*
 tests/
 results/
 /results/
+results*/
 test*/
 test*
 filtered_images_*/
@@ -53,4 +54,4 @@ UTag paper writing/
 manuscript/
 ITC_processing_final/
 revision_paper/
-sec_Figure_4_FRAP/
+sec_*

@@ -1,6 +1,6 @@
 """Paired-channel MSD analysis used by Multiplexing_MSD_Analysis.ipynb.
 
-This self-contained module loads validated MicroLive tracking exports, computes
+This path-agnostic module loads validated MicroLive tracking exports, computes
 cell-level normal and anomalous MSD fits, summarizes matched-channel spot
 properties, performs paired channel statistics, and creates the notebook's
 publication figures. Source files are pooled; cells are the biological samples
@@ -22,14 +22,13 @@ import pandas as pd
 import trackpy as tp
 from matplotlib import font_manager
 from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
 from microlive import microscopy as mi
 from scipy.stats import linregress, ttest_rel, wilcoxon
 
-MODULE_DIR = Path(__file__).resolve().parent
-DEFAULT_RESULTS_ROOT = MODULE_DIR / "multiplexing_data" / "results"
-
 _BASE_TABLE_FILENAMES = {
     "dataset_inventory": "dataset_inventory.csv",
+    "trajectory_filter_summary": "trajectory_filter_summary.csv",
     "trajectory_summary": "trajectory_summary.csv",
     "particle_msd": "particle_msd_long.csv",
     "cell_msd": "cell_msd_curves.csv",
@@ -38,8 +37,8 @@ _BASE_TABLE_FILENAMES = {
 }
 
 _CHANNEL_COLORS = (
-    "#0072B2",  # blue
-    "#D55E00",  # vermilion
+    "#00CC33",  # green (channel 0)
+    "#FF00FF",  # magenta (channel 1)
     "#009E73",  # bluish green
     "#CC79A7",  # reddish purple
 )
@@ -60,8 +59,8 @@ METRIC_SPECS = {
         "title": "Normal diffusion",
         "unit": "µm²/s",
         "trajectory_metric": None,
-        "default_log": True,
-        "zero_baseline": False,
+        "default_log": False,
+        "zero_baseline": True,
     },
     "alpha": {
         "label": "Anomalous exponent, α",
@@ -87,6 +86,14 @@ METRIC_SPECS = {
         "default_log": False,
         "zero_baseline": False,
     },
+    "cell_spot_snr": {
+        "label": "Mean spot SNR",
+        "title": "Spot signal-to-noise ratio",
+        "unit": "dimensionless",
+        "trajectory_metric": "trajectory_spot_snr",
+        "default_log": False,
+        "zero_baseline": True,
+    },
     "cell_spot_fwhm_um": {
         "label": "Mean spot FWHM (µm)",
         "title": "Spot size",
@@ -104,7 +111,7 @@ METRIC_SPECS = {
         "zero_baseline": False,
     },
     "n_trajectories": {
-        "label": "Tracked trajectories per cell",
+        "label": "No. trajectories per cell",
         "title": "Tracking yield",
         "unit": "trajectories",
         "trajectory_metric": None,
@@ -168,6 +175,14 @@ def _read_microlive_metadata(metadata_path: str | Path) -> dict[str, Any]:
     tracked_channels = _parse_channel_values(
         _optional_metadata_value(text, "Tracked Channels", path)
     )
+    snr_method_by_channel = {
+        int(channel): method.strip()
+        for channel, method in re.findall(
+            r"^\s*Channel\s+(\d+)\s+SNR Method\.+\s*(.*?)\s*$",
+            text,
+            flags=re.MULTILINE,
+        )
+    }
 
     if not np.isfinite(frame_interval_s) or frame_interval_s <= 0:
         raise ValueError(f"Invalid frame interval in {path}.")
@@ -193,6 +208,7 @@ def _read_microlive_metadata(metadata_path: str | Path) -> dict[str, Any]:
         "z_um_per_px": z_nm_per_px / 1000.0 if np.isfinite(z_nm_per_px) else np.nan,
         "projection_mode": projection_mode,
         "tracked_channels_metadata": tracked_channels,
+        "snr_method_by_channel": snr_method_by_channel,
         "is_3d": is_3d,
     }
 
@@ -339,8 +355,9 @@ def _normalize_tracking_dataframe(
 
 
 def _load_results(
-    results_root: str | Path = DEFAULT_RESULTS_ROOT,
+    results_root: str | Path,
     *,
+    strict: bool = True,
     verbose: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load and validate all ``results_*`` folders without modifying source data."""
@@ -393,8 +410,11 @@ def _load_results(
                 metadata=metadata,
             )
             for key, value in metadata.items():
-                if key != "metadata_path":
+                if key not in {"metadata_path", "snr_method_by_channel"}:
                     normalized[key] = [value] * len(normalized)
+            normalized["snr_method"] = normalized["channel"].map(
+                metadata["snr_method_by_channel"]
+            )
             channels = tuple(sorted(normalized["channel"].unique().tolist()))
             row.update(
                 {
@@ -414,6 +434,26 @@ def _load_results(
         inventory_rows.append(row)
 
     inventory = pd.DataFrame(inventory_rows)
+    invalid_rows = [
+        row for row in inventory_rows if row["validation_status"] != "valid"
+    ]
+    if invalid_rows and strict:
+        reasons = "\n".join(
+            f"- {row['source_id']}: {row['validation_reason']}"
+            for row in invalid_rows
+        )
+        raise ValueError(f"Invalid tracking result folders:\n{reasons}")
+    if invalid_rows:
+        reasons = "; ".join(
+            f"{row['source_id']}: {row['validation_reason']}"
+            for row in invalid_rows
+        )
+        warnings.warn(
+            f"Continuing without {len(invalid_rows)} invalid result folder(s): "
+            f"{reasons}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if not tracking_parts:
         reasons = "\n".join(
             f"- {row['source_id']}: {row['validation_reason']}"
@@ -458,6 +498,10 @@ def _trajectory_summary_for_unit(unit: pd.DataFrame) -> pd.DataFrame:
                 "first_frame": first_frame,
                 "last_frame": last_frame,
                 "span_frames": last_frame - first_frame + 1,
+                "n_missing_frames": last_frame - first_frame + 1 - len(frames),
+                "has_frame_gaps": bool(
+                    len(frames) > 1 and np.any(np.diff(frames) != 1)
+                ),
                 "elapsed_duration_s": (last_frame - first_frame) * dt,
                 "movie_fraction_observed": len(frames) / active_frames,
                 "maximum_supported_lag_frames": last_frame - first_frame,
@@ -467,25 +511,80 @@ def _trajectory_summary_for_unit(unit: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _trajectory_filter_summary(
+    tracking: pd.DataFrame,
+    *,
+    minimum_trajectory_frames: int,
+    reject_trajectory_gaps: bool,
+) -> pd.DataFrame:
+    """Describe and classify every trajectory before MSD calculations."""
+    rows: list[dict[str, Any]] = []
+    for particle_id, trajectory in tracking.groupby("global_particle_id", sort=True):
+        metadata = trajectory.iloc[0]
+        frames = np.sort(trajectory["frame"].dropna().astype(int).unique())
+        first_frame = int(frames[0])
+        last_frame = int(frames[-1])
+        span_frames = last_frame - first_frame + 1
+        n_unique_frames = int(len(frames))
+        n_missing_frames = int(span_frames - n_unique_frames)
+        has_frame_gaps = bool(
+            len(frames) > 1 and np.any(np.diff(frames) != 1)
+        )
+        too_short = n_unique_frames < int(minimum_trajectory_frames)
+        rejected_for_gaps = bool(reject_trajectory_gaps and has_frame_gaps)
+        reasons = []
+        if too_short:
+            reasons.append(f"fewer_than_{int(minimum_trajectory_frames)}_frames")
+        if rejected_for_gaps:
+            reasons.append("frame_gaps")
+        rows.append(
+            {
+                "condition": metadata["condition"],
+                "source_id": metadata["source_id"],
+                "local_cell_id": metadata["local_cell_id"],
+                "global_cell_id": metadata["global_cell_id"],
+                "channel": int(metadata["channel"]),
+                "original_particle_id": metadata["original_particle_id"],
+                "global_particle_id": particle_id,
+                "n_detections": int(len(trajectory)),
+                "n_unique_frames": n_unique_frames,
+                "first_frame": first_frame,
+                "last_frame": last_frame,
+                "span_frames": span_frames,
+                "n_missing_frames": n_missing_frames,
+                "has_frame_gaps": has_frame_gaps,
+                "eligible": not (too_short or rejected_for_gaps),
+                "exclusion_reason": ";".join(reasons),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _individual_msd_for_unit(
     unit: pd.DataFrame,
     *,
     max_lag_frames: int,
+    prepared_positions: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Calculate particle-level MSD curves and lag summaries for one unit."""
     metadata = unit.iloc[0]
     dt = float(metadata["frame_interval_s"])
     mpp = float(metadata["xy_um_per_px"])
     is_3d = bool(metadata["is_3d"])
-    columns = ["frame", "x", "y", "global_particle_id"]
     position_columns = ["x", "y"]
-    if is_3d:
-        columns.append("z")
-        position_columns.append("z")
-    prepared = unit[columns].copy()
-    prepared = prepared.rename(columns={"global_particle_id": "particle"})
-    if is_3d:
-        prepared["z"] *= float(metadata["z_um_per_px"]) / mpp
+    if prepared_positions is None:
+        columns = ["frame", "x", "y", "global_particle_id"]
+        if is_3d:
+            columns.append("z")
+            position_columns.append("z")
+        prepared = unit[columns].copy()
+        prepared = prepared.rename(columns={"global_particle_id": "particle"})
+        if is_3d:
+            prepared["z"] *= float(metadata["z_um_per_px"]) / mpp
+    else:
+        prepared = prepared_positions.copy()
+        if is_3d:
+            position_columns.append("z")
 
     individual = tp.imsd(
         prepared,
@@ -673,30 +772,49 @@ def _empty_unit_summary(
 
 
 def _analyze_tracking_results(
-    results_root: str | Path = DEFAULT_RESULTS_ROOT,
+    results_root: str | Path,
     *,
     maximum_fit_lag_seconds: float = 25.0,
     maximum_computed_lag_frames: int | None = None,
+    minimum_trajectory_frames: int = 1,
+    reject_trajectory_gaps: bool = False,
     channels: Sequence[int] | None = None,
     minimum_contributors_per_lag: int = 2,
     remove_drift: bool = False,
+    strict: bool = True,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Analyze every source cell and tracking channel.
 
     Normal and anomalous fits come directly from ``mi.ParticleMotion``.
     ``maximum_fit_lag_seconds`` controls the shared early-lag fit interval for
-    both models. The returned dictionary contains tidy tables plus the
-    MicroLive result objects needed to render fits without recalculation.
+    both models. ``minimum_trajectory_frames`` rejects trajectories with fewer
+    unique observed frames before MSD and spot-metric calculations. When
+    ``reject_trajectory_gaps`` is true, a trajectory is also rejected if any
+    frame is missing between its first and last observation. The returned
+    dictionary contains tidy tables plus the MicroLive result objects needed
+    to render fits without recalculation.
     """
     if not np.isfinite(maximum_fit_lag_seconds) or maximum_fit_lag_seconds <= 0:
         raise ValueError("maximum_fit_lag_seconds must be positive.")
     if maximum_computed_lag_frames is not None and maximum_computed_lag_frames < 1:
         raise ValueError("maximum_computed_lag_frames must be at least one.")
+    if (
+        isinstance(minimum_trajectory_frames, (bool, np.bool_))
+        or int(minimum_trajectory_frames) != minimum_trajectory_frames
+        or int(minimum_trajectory_frames) < 1
+    ):
+        raise ValueError("minimum_trajectory_frames must be a positive integer.")
+    if not isinstance(reject_trajectory_gaps, (bool, np.bool_)):
+        raise ValueError("reject_trajectory_gaps must be a boolean.")
     if minimum_contributors_per_lag < 1:
         raise ValueError("minimum_contributors_per_lag must be at least one.")
 
-    inventory, tracking = _load_results(results_root, verbose=verbose)
+    inventory, tracking = _load_results(
+        results_root,
+        strict=strict,
+        verbose=verbose,
+    )
     detected_channels = tuple(sorted(tracking["channel"].unique().tolist()))
     selected_channels = (
         detected_channels
@@ -708,6 +826,42 @@ def _analyze_tracking_results(
     absent_globally = sorted(set(selected_channels).difference(detected_channels))
     if absent_globally:
         raise ValueError(f"Requested channels are absent: {absent_globally}.")
+
+    trajectory_filter_summary = _trajectory_filter_summary(
+        tracking,
+        minimum_trajectory_frames=int(minimum_trajectory_frames),
+        reject_trajectory_gaps=bool(reject_trajectory_gaps),
+    )
+    retained_particle_ids = set(
+        trajectory_filter_summary.loc[
+            trajectory_filter_summary["eligible"], "global_particle_id"
+        ]
+    )
+    filtered_tracking = tracking.loc[
+        tracking["global_particle_id"].isin(retained_particle_ids)
+    ].copy()
+    rejected_short_count = int(
+        (
+            trajectory_filter_summary["n_unique_frames"]
+            < int(minimum_trajectory_frames)
+        ).sum()
+    )
+    rejected_gap_count = int(
+        (
+            (
+                trajectory_filter_summary["n_unique_frames"]
+                >= int(minimum_trajectory_frames)
+            )
+            & trajectory_filter_summary["has_frame_gaps"]
+            & bool(reject_trajectory_gaps)
+        ).sum()
+    )
+    if filtered_tracking.empty:
+        raise ValueError(
+            "No trajectories remain after applying trajectory acceptance: "
+            f"minimum_trajectory_frames={minimum_trajectory_frames}, "
+            f"reject_trajectory_gaps={bool(reject_trajectory_gaps)}."
+        )
 
     trajectory_parts: list[pd.DataFrame] = []
     particle_msd_parts: list[pd.DataFrame] = []
@@ -748,6 +902,41 @@ def _analyze_tracking_results(
                 cell_summary_rows.append(_empty_unit_summary(template, 0, reason))
                 continue
 
+            unit = unit.loc[
+                unit["global_particle_id"].isin(retained_particle_ids)
+            ].copy()
+            if unit.empty:
+                template = cell.iloc[0].to_dict()
+                template["channel"] = channel
+                template["local_cell_id"] = cell["local_cell_id"].iloc[0]
+                reason = (
+                    f"All trajectories in channel {channel} failed acceptance "
+                    f"(minimum {minimum_trajectory_frames} unique frames; "
+                    f"reject gaps={bool(reject_trajectory_gaps)})."
+                )
+                fit_points = int(
+                    math.floor(
+                        maximum_fit_lag_seconds / float(template["frame_interval_s"])
+                        + 1e-9
+                    )
+                )
+                for model in ("normal", "anomalous"):
+                    fit_rows.append(
+                        _fit_result_row(
+                            None,
+                            model=model,
+                            metadata=template,
+                            n_trajectories=0,
+                            requested_fit_lag_s=maximum_fit_lag_seconds,
+                            requested_fit_points=fit_points,
+                            failure_reason=reason,
+                        )
+                    )
+                cell_summary_rows.append(_empty_unit_summary(template, 0, reason))
+                if verbose:
+                    print(f"Warning: {global_cell_id}, channel {channel}: {reason}")
+                continue
+
             metadata = unit.iloc[0].to_dict()
             trajectory_summary = _trajectory_summary_for_unit(unit)
             trajectory_parts.append(trajectory_summary)
@@ -773,26 +962,6 @@ def _analyze_tracking_results(
                         f"contains fewer than two positive lags at Δt={dt:g} s."
                     )
 
-                particle_long, particle_summary = _individual_msd_for_unit(
-                    unit, max_lag_frames=computed_lag_frames
-                )
-                particle_long = particle_long.merge(
-                    trajectory_summary[
-                        [
-                            "global_particle_id",
-                            "n_detections",
-                            "n_unique_frames",
-                            "first_frame",
-                            "last_frame",
-                            "elapsed_duration_s",
-                        ]
-                    ],
-                    on="global_particle_id",
-                    how="left",
-                    validate="many_to_one",
-                )
-                particle_msd_parts.append(particle_long)
-
                 motion_input = unit.copy()
                 motion_input["unique_particle"] = motion_input["global_particle_id"]
                 motion = mi.ParticleMotion(
@@ -816,10 +985,33 @@ def _analyze_tracking_results(
                     _,
                     ensemble_msd,
                     _,
-                    fit_times,
                     _,
                     _,
+                    msd_positions,
                 ) = motion.calculate_msd()
+
+                # Use the same coordinates for the particle and ensemble MSDs.
+                # ``msd_positions`` is drift-corrected when requested.
+                particle_long, particle_summary = _individual_msd_for_unit(
+                    unit,
+                    max_lag_frames=computed_lag_frames,
+                    prepared_positions=msd_positions,
+                )
+                particle_long = particle_long.merge(
+                    trajectory_summary[
+                        [
+                            "global_particle_id",
+                            "n_detections",
+                            "n_unique_frames",
+                            "first_frame",
+                            "last_frame",
+                            "elapsed_duration_s",
+                        ]
+                    ],
+                    on="global_particle_id",
+                    how="left",
+                    validate="many_to_one",
+                )
 
                 ensemble = pd.DataFrame(
                     {
@@ -864,6 +1056,23 @@ def _analyze_tracking_results(
                     cell_curve["n_contributing_trajectories"].fillna(0)
                     >= minimum_contributors_per_lag
                 )
+
+                fit_data = cell_curve.loc[
+                    cell_curve["minimum_contributors_met"]
+                    & (cell_curve["lag_seconds"] > 0)
+                    & (cell_curve["lag_seconds"] <= maximum_fit_lag_seconds),
+                    ["lag_seconds", "pair_weighted_ensemble_msd_um2"],
+                ].dropna()
+                if len(fit_data) < 2:
+                    raise ValueError(
+                        "Fewer than two MSD lag points meet the fit interval and "
+                        f"minimum contributor threshold ({minimum_contributors_per_lag})."
+                    )
+                normal_fit, anomalous_fit = motion.fit_msd_models(
+                    fit_data["lag_seconds"].to_numpy(dtype=float),
+                    fit_data["pair_weighted_ensemble_msd_um2"].to_numpy(dtype=float),
+                )
+                fit_times = normal_fit.fit_times_s
                 cell_curve["is_fit_lag"] = cell_curve["lag_seconds"].apply(
                     lambda value: bool(
                         np.any(
@@ -876,10 +1085,8 @@ def _analyze_tracking_results(
                         )
                     )
                 )
+                particle_msd_parts.append(particle_long)
                 cell_msd_parts.append(cell_curve)
-
-                normal_fit = motion.normal_fit
-                anomalous_fit = motion.anomalous_fit
                 fit_rows.extend(
                     [
                         _fit_result_row(
@@ -934,6 +1141,11 @@ def _analyze_tracking_results(
                 )
             except Exception as exc:
                 reason = str(exc)
+                if strict:
+                    raise RuntimeError(
+                        f"MSD analysis failed for {global_cell_id}, channel {channel}: "
+                        f"{reason}"
+                    ) from exc
                 for model in ("normal", "anomalous"):
                     fit_rows.append(
                         _fit_result_row(
@@ -974,14 +1186,18 @@ def _analyze_tracking_results(
         "results_root": str(Path(results_root).expanduser().resolve()),
         "maximum_fit_lag_seconds": float(maximum_fit_lag_seconds),
         "maximum_computed_lag_frames": maximum_computed_lag_frames,
+        "minimum_trajectory_frames": int(minimum_trajectory_frames),
+        "reject_trajectory_gaps": bool(reject_trajectory_gaps),
         "channels": selected_channels,
         "minimum_contributors_per_lag": int(minimum_contributors_per_lag),
         "remove_drift": bool(remove_drift),
+        "strict_validation": bool(strict),
     }
     analysis = {
         "configuration": configuration,
         "dataset_inventory": inventory,
-        "tracking_data": tracking,
+        "trajectory_filter_summary": trajectory_filter_summary,
+        "tracking_data": filtered_tracking,
         "trajectory_summary": trajectory_summary,
         "particle_msd": particle_msd,
         "cell_msd": cell_msd,
@@ -1000,6 +1216,16 @@ def _analyze_tracking_results(
             f"Analyzed {len(unit_results)} cell/channel units. "
             f"Trajectory totals by channel: {counts.to_dict()}"
         )
+        if rejected_short_count:
+            print(
+                f"Rejected {rejected_short_count} trajectories shorter than "
+                f"{minimum_trajectory_frames} frames."
+            )
+        if rejected_gap_count:
+            print(
+                f"Rejected {rejected_gap_count} additional trajectories with "
+                "internal frame gaps."
+            )
     return analysis
 
 
@@ -1039,52 +1265,55 @@ def _publication_font() -> str:
         return "DejaVu Sans"
 
 
-def _publication_style() -> mpl.rc_context:
+def _publication_style(
+    overrides: Mapping[str, Any] | None = None,
+) -> mpl.rc_context:
     """Return the shared white-background, no-grid publication style context."""
     font_name = _publication_font()
-    return mpl.rc_context(
-        {
-            "font.family": "sans-serif",
-            "font.sans-serif": [font_name],
-            "font.size": 14,
-            "text.color": "black",
-            "axes.labelsize": 19,
-            "axes.labelweight": "semibold",
-            "axes.labelcolor": "black",
-            "axes.titlesize": 19,
-            "axes.titleweight": "semibold",
-            "axes.titlecolor": "black",
-            "axes.edgecolor": "black",
-            "axes.linewidth": 1.6,
-            "axes.facecolor": "white",
-            "axes.grid": False,
-            "figure.facecolor": "white",
-            "figure.edgecolor": "white",
-            "savefig.facecolor": "white",
-            "savefig.edgecolor": "white",
-            "savefig.transparent": False,
-            "xtick.labelsize": 15,
-            "ytick.labelsize": 15,
-            "xtick.color": "black",
-            "ytick.color": "black",
-            "xtick.direction": "out",
-            "ytick.direction": "out",
-            "xtick.major.size": 6,
-            "ytick.major.size": 6,
-            "xtick.major.width": 1.5,
-            "ytick.major.width": 1.5,
-            "xtick.minor.size": 3,
-            "ytick.minor.size": 3,
-            "xtick.minor.width": 1.0,
-            "ytick.minor.width": 1.0,
-            "legend.fontsize": 11,
-            "legend.frameon": True,
-            "legend.edgecolor": "black",
-            "legend.facecolor": "white",
-            "legend.framealpha": 0.95,
-            "svg.fonttype": "none",
-        }
-    )
+    settings = {
+        "font.family": "sans-serif",
+        "font.sans-serif": [font_name],
+        "font.size": 18,
+        "text.color": "black",
+        "axes.labelsize": 24,
+        "axes.labelweight": "semibold",
+        "axes.labelcolor": "black",
+        "axes.titlesize": 22,
+        "axes.titleweight": "semibold",
+        "axes.titlecolor": "black",
+        "axes.edgecolor": "black",
+        "axes.linewidth": 1.6,
+        "axes.facecolor": "white",
+        "axes.grid": False,
+        "figure.facecolor": "white",
+        "figure.edgecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.edgecolor": "white",
+        "savefig.transparent": False,
+        "xtick.labelsize": 20,
+        "ytick.labelsize": 20,
+        "xtick.color": "black",
+        "ytick.color": "black",
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "xtick.major.size": 6,
+        "ytick.major.size": 6,
+        "xtick.major.width": 1.5,
+        "ytick.major.width": 1.5,
+        "xtick.minor.size": 3,
+        "ytick.minor.size": 3,
+        "xtick.minor.width": 1.0,
+        "ytick.minor.width": 1.0,
+        "legend.fontsize": 15,
+        "legend.frameon": True,
+        "legend.edgecolor": "black",
+        "legend.facecolor": "white",
+        "legend.framealpha": 0.95,
+        "svg.fonttype": "none",
+    }
+    if overrides:
+        settings.update(dict(overrides))
+    return mpl.rc_context(settings)
 
 
 # Paired-channel summaries, statistics, and figures
@@ -1268,6 +1497,7 @@ def summarize_spot_metrics(
     summarized once per trajectory before trajectories are summarized per cell.
     """
     required = {
+        "condition",
         "source_id",
         "local_cell_id",
         "global_cell_id",
@@ -1275,6 +1505,7 @@ def summarize_spot_metrics(
         "global_particle_id",
         "frame",
         "xy_um_per_px",
+        "snr_method",
     }
     missing = sorted(required.difference(tracking_data.columns))
     if missing:
@@ -1307,10 +1538,11 @@ def summarize_spot_metrics(
     for channel in selected_channels:
         measurement_channel = measurement_map[channel]
         intensity_column = f"spot_int_ch_{measurement_channel}"
+        snr_column = f"snr_ch_{measurement_channel}"
         size_column = f"spot_size_ch_{measurement_channel}"
         absent = [
             column
-            for column in (intensity_column, size_column)
+            for column in (intensity_column, snr_column, size_column)
             if column not in tracking_data.columns
         ]
         if absent:
@@ -1320,6 +1552,19 @@ def summarize_spot_metrics(
             )
 
         selected = tracking_data.loc[tracking_data["channel"] == channel].copy()
+        snr_methods = set(
+            selected["snr_method"]
+            .fillna("missing")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .unique()
+        )
+        if snr_methods != {"disk_doughnut"}:
+            raise ValueError(
+                f"Tracking channel {channel} must use MicroLive's "
+                f"disk_doughnut SNR method; found {sorted(snr_methods)}."
+            )
         calibration = pd.to_numeric(selected["xy_um_per_px"], errors="coerce").to_numpy(
             dtype=float
         )
@@ -1331,6 +1576,7 @@ def summarize_spot_metrics(
         selected["spot_intensity_au"] = pd.to_numeric(
             selected[intensity_column], errors="coerce"
         )
+        selected["spot_snr"] = pd.to_numeric(selected[snr_column], errors="coerce")
         selected["spot_fwhm_px"] = pd.to_numeric(selected[size_column], errors="coerce")
         finite_size = selected["spot_fwhm_px"].dropna().to_numpy(dtype=float)
         if finite_size.size and (
@@ -1348,6 +1594,7 @@ def summarize_spot_metrics(
 
     prepared = pd.concat(parts, ignore_index=True, sort=False)
     trajectory_keys = [
+        "condition",
         "source_id",
         "local_cell_id",
         "global_cell_id",
@@ -1367,6 +1614,7 @@ def summarize_spot_metrics(
                 "spot_intensity_au",
                 trajectory_reducer,
             ),
+            trajectory_spot_snr=("spot_snr", trajectory_reducer),
             trajectory_spot_fwhm_px=("spot_fwhm_px", trajectory_reducer),
             trajectory_spot_fwhm_um=("spot_fwhm_um", trajectory_reducer),
             trajectory_spot_fwhm_nm=("spot_fwhm_nm", trajectory_reducer),
@@ -1376,6 +1624,7 @@ def summarize_spot_metrics(
     )
 
     cell_keys = [
+        "condition",
         "source_id",
         "local_cell_id",
         "global_cell_id",
@@ -1391,11 +1640,13 @@ def summarize_spot_metrics(
                 "trajectory_spot_intensity_au",
                 "count",
             ),
+            n_snr_trajectories=("trajectory_spot_snr", "count"),
             n_fwhm_trajectories=("trajectory_spot_fwhm_um", "count"),
             cell_spot_intensity_au=(
                 "trajectory_spot_intensity_au",
                 cell_reducer,
             ),
+            cell_spot_snr=("trajectory_spot_snr", cell_reducer),
             cell_spot_fwhm_px=("trajectory_spot_fwhm_px", cell_reducer),
             cell_spot_fwhm_um=("trajectory_spot_fwhm_um", cell_reducer),
             cell_spot_fwhm_nm=("trajectory_spot_fwhm_nm", cell_reducer),
@@ -1439,6 +1690,7 @@ def build_channel_condition_summary(
             "alpha",
             "K_alpha_um2_s_alpha",
             "cell_spot_intensity_au",
+            "cell_spot_snr",
             "cell_spot_fwhm_um",
             "cell_spot_fwhm_nm",
             "n_trajectories",
@@ -1488,10 +1740,12 @@ def build_channel_condition_summary(
 
 
 def analyze_final_results(
-    results_root: str | Path = DEFAULT_RESULTS_ROOT,
+    results_root: str | Path,
     *,
     maximum_fit_lag_seconds: float = 100.0,
     maximum_computed_lag_frames: int | None = None,
+    minimum_trajectory_frames: int = 1,
+    reject_trajectory_gaps: bool = False,
     channels: Sequence[int] | None = None,
     minimum_contributors_per_lag: int = 2,
     remove_drift: bool = False,
@@ -1499,16 +1753,20 @@ def analyze_final_results(
     measurement_channel_map: Mapping[int, int] | None = None,
     trajectory_reducer: str = "mean",
     cell_reducer: str = "mean",
+    strict: bool = True,
     verbose: bool = True,
 ) -> dict[str, Any]:
-    """Run the existing MicroLive MSD analysis and add paired-channel summaries."""
+    """Run MSD analysis with trajectory filtering and add paired summaries."""
     analysis = _analyze_tracking_results(
         results_root,
         maximum_fit_lag_seconds=maximum_fit_lag_seconds,
         maximum_computed_lag_frames=maximum_computed_lag_frames,
+        minimum_trajectory_frames=minimum_trajectory_frames,
+        reject_trajectory_gaps=reject_trajectory_gaps,
         channels=channels,
         minimum_contributors_per_lag=minimum_contributors_per_lag,
         remove_drift=remove_drift,
+        strict=strict,
         verbose=verbose,
     )
     selected_channels = [
@@ -1521,18 +1779,15 @@ def analyze_final_results(
         selected_channels, measurement_channel_map
     )
 
-    # Pool source files explicitly. Source IDs remain available for unique IDs.
+    # Source files are pooled by downstream channel summaries. Preserve each
+    # source condition in the detailed tables for provenance.
     updated: dict[str, Any] = dict(analysis)
     for key, value in analysis.items():
         if isinstance(value, pd.DataFrame):
-            table = _add_channel_condition_column(value, labels)
-            if "condition" in table.columns:
-                table["condition"] = "All cells"
-            updated[key] = table
+            updated[key] = _add_channel_condition_column(value, labels)
     updated_units: list[dict[str, Any]] = []
     for unit in analysis["unit_results"]:
         copied = dict(unit)
-        copied["condition"] = "All cells"
         copied["channel_condition"] = labels[int(copied["channel"])]
         updated_units.append(copied)
     updated["unit_results"] = updated_units
@@ -1546,9 +1801,8 @@ def analyze_final_results(
         cell_reducer=cell_reducer,
     )
     cell_base = updated["cell_summary"].copy()
-    if "condition" in cell_base.columns:
-        cell_base = cell_base.drop(columns="condition")
     merge_keys = [
+        "condition",
         "source_id",
         "local_cell_id",
         "global_cell_id",
@@ -1622,6 +1876,7 @@ def analyze_final_results(
             "measurement_channel_map": measurement_map,
             "trajectory_spot_reducer": _validate_reducer(trajectory_reducer),
             "cell_spot_reducer": _validate_reducer(cell_reducer),
+            "strict_validation": bool(strict),
         }
     )
     updated["configuration"] = configuration
@@ -1689,6 +1944,36 @@ def _complete_cell_ids(
     return sorted(counts[counts == len(channels)].index.tolist())
 
 
+def _validate_summary_options(center: str, uncertainty: str) -> tuple[str, str]:
+    """Validate a statistically coherent center and uncertainty pairing."""
+    center = str(center).lower()
+    uncertainty = str(uncertainty).lower()
+    allowed = {
+        "mean": {"sem", "sd", "none"},
+        "median": {"iqr", "none"},
+    }
+    if center not in allowed:
+        raise ValueError("center must be 'mean' or 'median'.")
+    if uncertainty not in {"sem", "sd", "iqr", "none"}:
+        raise ValueError("uncertainty must be 'sem', 'sd', 'iqr', or 'none'.")
+    if uncertainty not in allowed[center]:
+        choices = ", ".join(sorted(allowed[center]))
+        raise ValueError(
+            f"uncertainty={uncertainty!r} is not appropriate for center={center!r}; "
+            f"choose one of: {choices}."
+        )
+    return center, uncertainty
+
+
+def _summary_legend_label(center: str, uncertainty: str) -> str:
+    """Format a concise center/uncertainty description for legends."""
+    if uncertainty == "none":
+        return center
+    if uncertainty == "iqr":
+        return f"{center} with IQR"
+    return f"{center} ± {uncertainty.upper()}"
+
+
 def _curve_spread(
     values: np.ndarray,
     *,
@@ -1739,12 +2024,7 @@ def build_channel_msd_summary(
     normal_fit_max_lag_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Aggregate one cell MSD curve per paired channel condition."""
-    center = str(center).lower()
-    uncertainty = str(uncertainty).lower()
-    if center not in {"mean", "median"}:
-        raise ValueError("center must be 'mean' or 'median'.")
-    if uncertainty not in {"sem", "sd", "iqr", "none"}:
-        raise ValueError("uncertainty must be 'sem', 'sd', 'iqr', or 'none'.")
+    center, uncertainty = _validate_summary_options(center, uncertainty)
     if maximum_display_lag_seconds is not None and maximum_display_lag_seconds <= 0:
         raise ValueError("maximum_display_lag_seconds must be positive.")
     if normal_fit_max_lag_seconds is not None and normal_fit_max_lag_seconds <= 0:
@@ -1838,6 +2118,11 @@ def build_channel_msd_summary(
     if summary.empty:
         raise ValueError("No paired cell MSD values are available.")
 
+    if normal_fit_max_lag_seconds is None:
+        normal_fit_max_lag_seconds = analysis["configuration"].get("normal_fit_max_lag_seconds")
+    if normal_fit_max_lag_seconds is None:
+        normal_fit_max_lag_seconds = 10.0
+
     fit_rows: list[dict[str, Any]] = []
     if normal_fit_max_lag_seconds is not None:
         for channel in selected_channels:
@@ -1889,7 +2174,11 @@ def build_channel_msd_summary(
         d_cell_ids = set(channel_d["global_cell_id"].unique())
         included_ids = sorted(d_cell_ids.intersection(msd_cell_ids))
         included_d = channel_d[channel_d["global_cell_id"].isin(included_ids)]
-        group_fit = fit_summary[fit_summary["channel"] == channel]
+        group_fit = (
+            fit_summary[fit_summary["channel"] == channel]
+            if "channel" in fit_summary.columns
+            else pd.DataFrame()
+        )
         group_fit_d = (
             float(group_fit.iloc[0]["D_group_curve_um2_s"])
             if not group_fit.empty
@@ -2198,7 +2487,8 @@ def _draw_significance_bracket(
         label,
         ha="center",
         va="bottom",
-        fontsize=11,
+        fontsize=mpl.rcParams["font.size"],
+        fontweight="bold",
         color="black",
     )
 
@@ -2214,13 +2504,19 @@ def _draw_cell_metric_on_ax(
     show_trajectory_background: bool,
     connect_paired_cells: bool,
     show_box: bool,
+    box_width: float = 0.28,
+    cap_width: float | None = 0.18,
+    show_center_uncertainty: bool,
+    condition_spacing: float,
     log_scale: bool,
     display_upper_percentile: float | None,
     statistics: pd.DataFrame | None,
     statistics_label_style: str,
     show_legend: bool,
+    show_sample_counts: bool,
 ) -> pd.DataFrame:
     """Draw cell-level metric distributions and paired comparisons."""
+    center, uncertainty = _validate_summary_options(center, uncertainty)
     if metric not in METRIC_SPECS:
         raise ValueError(f"Unsupported metric {metric!r}.")
     data = _metric_valid_rows(analysis["cell_analysis_summary"], metric)
@@ -2238,7 +2534,12 @@ def _draw_cell_metric_on_ax(
 
     labels = analysis["configuration"]["channel_condition_labels"]
     encodings = _channel_encoding(channels)
-    positions = {channel: index for index, channel in enumerate(channels)}
+    if float(condition_spacing) <= 0:
+        raise ValueError("condition_spacing must be positive.")
+    positions = {
+        channel: index * float(condition_spacing)
+        for index, channel in enumerate(channels)
+    }
     display_thresholds: dict[int, float] = {}
     display_parts: list[pd.DataFrame] = []
     for channel in channels:
@@ -2253,11 +2554,12 @@ def _draw_cell_metric_on_ax(
         display_parts.append(channel_data[channel_data[metric] <= threshold])
     display_data = pd.concat(display_parts, ignore_index=False)
     all_cells = sorted(data["global_cell_id"].unique())
+    jitter_rng = np.random.default_rng(417)
     cell_jitter = {
-        cell: offset
+        cell: float(offset)
         for cell, offset in zip(
             all_cells,
-            np.linspace(-0.16, 0.16, max(len(all_cells), 1)),
+            jitter_rng.uniform(-0.14, 0.14, max(len(all_cells), 1)),
         )
     }
 
@@ -2313,28 +2615,30 @@ def _draw_cell_metric_on_ax(
             )
             for channel in channels
         ]
-        boxplot = ax.boxplot(
-            box_values,
-            positions=[positions[channel] for channel in channels],
-            widths=0.42,
-            patch_artist=True,
-            showfliers=False,
-            zorder=2,
-        )
+        bp_kwargs: dict[str, Any] = {
+            "positions": [positions[channel] for channel in channels],
+            "widths": float(box_width),
+            "patch_artist": True,
+            "showfliers": False,
+            "whis": (5, 95),
+            "zorder": 1,
+        }
+        if cap_width is not None:
+            bp_kwargs["capwidths"] = float(cap_width)
+        boxplot = ax.boxplot(box_values, **bp_kwargs)
         for patch in boxplot["boxes"]:
-            patch.set_facecolor("none")
+            patch.set_facecolor("white")
             patch.set_edgecolor("black")
-            patch.set_linewidth(1.5)
+            patch.set_linewidth(2.2)
         for element in ("whiskers", "caps", "medians"):
             for artist in boxplot[element]:
-                artist.set_color("red" if element == "medians" else "black")
-                artist.set_linewidth(2.2 if element == "medians" else 1.5)
+                artist.set_color("#D62728" if element == "medians" else "black")
+                artist.set_linewidth(2.8 if element == "medians" else 2.2)
 
     for channel in channels:
         channel_data = display_data[display_data["channel"] == channel].sort_values(
             "global_cell_id"
         )
-        color, marker = encodings[channel]
         x = np.asarray(
             [
                 positions[channel] + cell_jitter.get(cell_id, 0.0)
@@ -2345,12 +2649,12 @@ def _draw_cell_metric_on_ax(
         ax.scatter(
             x,
             channel_data[metric],
-            s=88,
-            marker=marker,
-            color=color,
+            s=34,
+            marker="o",
+            color="black",
             edgecolor="black",
-            linewidth=0.9,
-            alpha=0.92,
+            linewidth=0.35,
+            alpha=0.95,
             zorder=3,
         )
 
@@ -2374,33 +2678,38 @@ def _draw_cell_metric_on_ax(
             for channel in channels
         }
     )
-    for row in summary.itertuples(index=False):
-        color, marker = encodings[int(row.channel)]
-        lower_error = max(float(row.center - row.lower), 0.0)
-        upper_error = max(float(row.upper - row.center), 0.0)
-        yerr = (
-            None
-            if uncertainty == "none"
-            else np.asarray([[lower_error], [upper_error]], dtype=float)
-        )
-        ax.errorbar(
-            [positions[int(row.channel)]],
-            [row.center],
-            yerr=yerr,
-            fmt=marker,
-            markersize=12,
-            markerfacecolor=color,
-            markeredgecolor="white",
-            markeredgewidth=1.4,
-            color="black",
-            elinewidth=2.4,
-            capsize=6,
-            capthick=2.2,
-            zorder=5,
-        )
+    if show_center_uncertainty:
+        for row in summary.itertuples(index=False):
+            color, marker = encodings[int(row.channel)]
+            lower_error = max(float(row.center - row.lower), 0.0)
+            upper_error = max(float(row.upper - row.center), 0.0)
+            yerr = (
+                None
+                if uncertainty == "none"
+                else np.asarray([[lower_error], [upper_error]], dtype=float)
+            )
+            ax.errorbar(
+                [positions[int(row.channel)]],
+                [row.center],
+                yerr=yerr,
+                fmt=marker,
+                markersize=12,
+                markerfacecolor=color,
+                markeredgecolor="white",
+                markeredgewidth=1.4,
+                color="black",
+                elinewidth=2.4,
+                capsize=6,
+                capthick=2.2,
+                zorder=5,
+            )
 
     if log_scale:
         ax.set_yscale("log")
+    elif metric == "n_trajectories":
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=7, integer=True))
+    else:
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=7, min_n_ticks=5))
     ax.set_xticks(
         [positions[channel] for channel in channels],
         [labels[channel] for channel in channels],
@@ -2415,23 +2724,31 @@ def _draw_cell_metric_on_ax(
         spine.set_color("black")
         spine.set_linewidth(1.6)
     ax.tick_params(axis="both", which="both", colors="black")
-    for row in summary.itertuples(index=False):
-        hidden = int(row.n_cells_above_display_percentile)
-        hidden_text = (
-            f"; {hidden} >P{float(display_upper_percentile):g} hidden"
-            if hidden and display_upper_percentile is not None
-            else ""
-        )
-        ax.text(
-            positions[int(row.channel)],
-            -0.11,
-            f"n = {int(row.n_cells)} cells{hidden_text}",
-            transform=ax.get_xaxis_transform(),
-            ha="center",
-            va="top",
-            fontsize=10.5,
-            color="#555555",
-        )
+    font_family = mpl.rcParams["font.sans-serif"][0]
+    ax.yaxis.label.set_fontfamily(font_family)
+    ax.yaxis.label.set_color("black")
+    for tick_label in [*ax.get_xticklabels(), *ax.get_yticklabels()]:
+        tick_label.set_fontfamily(font_family)
+        tick_label.set_color("black")
+        tick_label.set_fontweight("semibold")
+    if show_sample_counts:
+        for row in summary.itertuples(index=False):
+            hidden = int(row.n_cells_above_display_percentile)
+            hidden_text = (
+                f"; {hidden} >P{float(display_upper_percentile):g} hidden"
+                if hidden and display_upper_percentile is not None
+                else ""
+            )
+            ax.text(
+                positions[int(row.channel)],
+                -0.11,
+                f"n = {int(row.n_cells)} cells{hidden_text}",
+                transform=ax.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=10.5,
+                color="#555555",
+            )
 
     if display_upper_percentile is not None:
         visible_upper = max(display_thresholds.values())
@@ -2535,31 +2852,35 @@ def plot_cell_metric(
     show_trajectory_background: bool = False,
     connect_paired_cells: bool = False,
     show_box: bool = True,
+    box_width: float = 0.32,
+    cap_width: float | None = 0.20,
+    show_center_uncertainty: bool = False,
+    condition_spacing: float = 1.40,
     log_scale: bool | None = None,
     display_upper_percentile: float | None = 95.0,
     statistics: pd.DataFrame | None = None,
     statistics_label_style: str = "stars",
     show_legend: bool = False,
+    show_sample_counts: bool = True,
+    show_title: bool = True,
+    ylabel: str | None = None,
+    figsize: tuple[float, float] = (6.4, 6.2),
+    plot_style: Mapping[str, Any] | None = None,
     output_directory: str | Path | None = None,
     show: bool = True,
     dpi: int = 600,
 ) -> tuple[plt.Figure, plt.Axes, pd.DataFrame]:
     """Plot a metric with cells as samples and channels as paired conditions."""
-    center = str(center).lower()
-    uncertainty = str(uncertainty).lower()
-    if center not in {"mean", "median"}:
-        raise ValueError("center must be 'mean' or 'median'.")
-    if uncertainty not in {"sem", "sd", "iqr", "none"}:
-        raise ValueError("uncertainty must be 'sem', 'sd', 'iqr', or 'none'.")
+    center, uncertainty = _validate_summary_options(center, uncertainty)
     available = sorted(
         analysis["cell_analysis_summary"]["channel"].dropna().astype(int).unique()
     )
     selected_channels = _normalize_selection(available, channels)
     if log_scale is None:
         log_scale = bool(METRIC_SPECS[metric]["default_log"])
-    with _publication_style():
+    with _publication_style(plot_style):
         fig, ax = plt.subplots(
-            figsize=(7.8, 6.5),
+            figsize=figsize,
             constrained_layout=True,
             facecolor="white",
         )
@@ -2573,12 +2894,21 @@ def plot_cell_metric(
             show_trajectory_background=show_trajectory_background,
             connect_paired_cells=connect_paired_cells,
             show_box=show_box,
+            box_width=box_width,
+            cap_width=cap_width,
+            show_center_uncertainty=show_center_uncertainty,
+            condition_spacing=condition_spacing,
             log_scale=bool(log_scale),
             display_upper_percentile=display_upper_percentile,
             statistics=statistics,
             statistics_label_style=statistics_label_style,
             show_legend=show_legend,
+            show_sample_counts=show_sample_counts,
         )
+        if not show_title:
+            ax.set_title("")
+        if ylabel is not None:
+            ax.set_ylabel(str(ylabel))
         if output_directory is not None:
             _save_figure(
                 fig,
@@ -2603,6 +2933,8 @@ def _draw_channel_msd_on_ax(
     show_individual_cells: bool,
     error_style: str,
     scale: str,
+    show_sample_counts: bool,
+    single_label_legend: bool = True,
 ) -> tuple[list[Any], list[str]]:
     """Draw channel-level MSD curves, uncertainty, and optional fits."""
     summary = msd_result["plot_summary"]
@@ -2689,14 +3021,12 @@ def _draw_channel_msd_on_ax(
                 zorder=3,
             )
         handles.append(mean_handle)
-        n_min = int(data["n_cells"].min())
-        n_max = int(data["n_cells"].max())
-        n_text = f"n={n_min}" if n_min == n_max else f"n={n_min}–{n_max}"
-        legend_labels.append(
-            f"{labels[channel]}: {center} ± {uncertainty.upper()} ({n_text} cells)"
-        )
 
-        fit = fit_summary[fit_summary["channel"] == channel]
+        fit = (
+            fit_summary[fit_summary["channel"] == channel]
+            if "channel" in fit_summary.columns
+            else pd.DataFrame()
+        )
         if not fit.empty:
             fit_row = fit.iloc[0]
             x_fit = np.linspace(
@@ -2705,7 +3035,7 @@ def _draw_channel_msd_on_ax(
                 200,
             )
             y_fit = float(fit_row["slope_um2_s"]) * x_fit + float(fit_row["offset_um2"])
-            (fit_handle,) = ax.plot(
+            ax.plot(
                 x_fit,
                 y_fit,
                 linestyle="--",
@@ -2713,15 +3043,31 @@ def _draw_channel_msd_on_ax(
                 linewidth=3.2,
                 zorder=4,
             )
-            handles.append(fit_handle)
-            legend_labels.append(
-                f"{labels[channel]} normal fit: "
-                f"D={float(fit_row['D_group_curve_um2_s']):.3e} µm²/s"
-            )
+            d_val = float(fit_row["D_group_curve_um2_s"])
+            if single_label_legend:
+                legend_labels.append(f"{labels[channel]} (D={d_val:.2e} µm²/s)")
+            else:
+                summary_label = _summary_legend_label(center, uncertainty)
+                if show_sample_counts:
+                    n_min = int(data["n_cells"].min())
+                    n_max = int(data["n_cells"].max())
+                    n_text = f"n={n_min}" if n_min == n_max else f"n={n_min}–{n_max}"
+                    legend_labels.append(
+                        f"{labels[channel]}: {summary_label} ({n_text} cells)"
+                    )
+                else:
+                    legend_labels.append(f"{labels[channel]}: {summary_label}")
+                (fit_handle,) = ax.plot([], [], linestyle="--", color=color, linewidth=3.2)
+                handles.append(fit_handle)
+                legend_labels.append(
+                    f"{labels[channel]} normal fit: D={d_val:.2e} µm²/s"
+                )
+        else:
+            legend_labels.append(f"{labels[channel]}")
 
     ax.set_xlabel("Time lag (s)")
     ax.set_ylabel("MSD (µm²)")
-    ax.set_title("Mean MSD across paired cell samples", pad=13)
+    ax.set_title(f"{center.title()} MSD across paired cell samples", pad=13)
     ax.set_facecolor("white")
     ax.grid(False, which="both")
     for spine in ax.spines.values():
@@ -2754,7 +3100,12 @@ def plot_channel_msd(
     scale: str = "linear",
     maximum_display_lag_seconds: float | None = None,
     normal_fit_max_lag_seconds: float | None = None,
-    legend_outside_left: bool = True,
+    legend_outside_left: bool | None = None,
+    legend_position: str | None = "top",
+    figsize: tuple[float, float] | None = None,
+    show_sample_counts: bool = True,
+    show_title: bool = True,
+    plot_style: Mapping[str, Any] | None = None,
     output_directory: str | Path | None = None,
     show: bool = True,
     dpi: int = 600,
@@ -2762,6 +3113,8 @@ def plot_channel_msd(
     """Plot paired channel-condition MSD summaries across cell samples."""
     if error_style not in {"bars", "band"}:
         raise ValueError("error_style must be 'bars' or 'band'.")
+    if legend_outside_left is not None:
+        legend_position = "left" if legend_outside_left else "top"
     msd_result = build_channel_msd_summary(
         analysis,
         channels=channels,
@@ -2773,10 +3126,11 @@ def plot_channel_msd(
         maximum_display_lag_seconds=maximum_display_lag_seconds,
         normal_fit_max_lag_seconds=normal_fit_max_lag_seconds,
     )
-    with _publication_style():
-        if legend_outside_left:
+    with _publication_style(plot_style):
+        if legend_position == "left":
+            fig_size = figsize if figsize is not None else (13.5, 7.2)
             fig = plt.figure(
-                figsize=(13.5, 7.2),
+                figsize=fig_size,
                 constrained_layout=True,
                 facecolor="white",
             )
@@ -2784,9 +3138,18 @@ def plot_channel_msd(
             legend_ax = fig.add_subplot(layout[0, 0])
             ax = fig.add_subplot(layout[0, 1])
             legend_ax.axis("off")
-        else:
+        elif legend_position == "top":
+            fig_size = figsize if figsize is not None else (8.5, 6.8)
             fig, ax = plt.subplots(
-                figsize=(8.5, 6.5),
+                figsize=fig_size,
+                constrained_layout=True,
+                facecolor="white",
+            )
+            legend_ax = None
+        else:
+            fig_size = figsize if figsize is not None else (8.5, 6.5)
+            fig, ax = plt.subplots(
+                figsize=fig_size,
                 constrained_layout=True,
                 facecolor="white",
             )
@@ -2797,18 +3160,38 @@ def plot_channel_msd(
             show_individual_cells=show_individual_cells,
             error_style=error_style,
             scale=scale,
+            show_sample_counts=show_sample_counts,
         )
-        if legend_ax is not None:
+        if not show_title:
+            ax.set_title("")
+        leg_fs = (
+            plot_style.get("legend.fontsize", mpl.rcParams.get("legend.fontsize", 10))
+            if plot_style is not None
+            else mpl.rcParams.get("legend.fontsize", 10)
+        )
+        if legend_position == "left" and legend_ax is not None:
             legend_ax.legend(
                 handles,
                 labels,
                 loc="center left",
                 frameon=False,
-                fontsize=13,
+                fontsize=leg_fs,
                 handlelength=2.7,
                 labelspacing=0.9,
             )
-        else:
+        elif legend_position == "top":
+            ax.legend(
+                handles,
+                labels,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 1.02),
+                ncol=len(handles) if len(handles) <= 3 else 2,
+                frameon=False,
+                fontsize=leg_fs,
+                handlelength=2.5,
+                columnspacing=1.5,
+            )
+        elif legend_position in {"right", "outside_right"}:
             ax.legend(
                 handles,
                 labels,
@@ -2816,6 +3199,15 @@ def plot_channel_msd(
                 bbox_to_anchor=(1.02, 1.0),
                 borderaxespad=0,
                 frameon=False,
+                fontsize=leg_fs,
+            )
+        elif legend_position is not None:
+            ax.legend(
+                handles,
+                labels,
+                loc=legend_position,
+                frameon=False,
+                fontsize=leg_fs,
             )
         if output_directory is not None:
             config = msd_result["configuration"]
@@ -2850,12 +3242,23 @@ def plot_combined_summary(
     uncertainty: str = "sem",
     show_trajectory_background: bool = False,
     connect_paired_cells: bool = False,
+    show_box: bool = True,
+    box_width: float = 0.32,
+    cap_width: float | None = 0.20,
+    show_center_uncertainty: bool = False,
+    condition_spacing: float = 1.40,
     display_upper_percentile: float | None = 95.0,
     msd_error_style: str = "band",
+    msd_scale: str = "linear",
     maximum_display_lag_seconds: float | None = None,
     normal_fit_max_lag_seconds: float | None = None,
+    single_label_legend: bool = True,
     statistics: pd.DataFrame | None = None,
     statistics_label_style: str = "stars",
+    show_sample_counts: bool = True,
+    show_panel_titles: bool = True,
+    panel_ylabels: Mapping[str, str] | None = None,
+    plot_style: Mapping[str, Any] | None = None,
     output_directory: str | Path | None = None,
     show: bool = True,
     dpi: int = 600,
@@ -2879,6 +3282,8 @@ def plot_combined_summary(
         raise ValueError(f"Unsupported combined-summary panels: {invalid}.")
     if not panels:
         raise ValueError("At least one panel must be requested.")
+    if msd_error_style not in {"bars", "band"}:
+        raise ValueError("msd_error_style must be 'bars' or 'band'.")
     if statistics is None:
         stored_statistics = analysis.get("paired_channel_statistics")
         if isinstance(stored_statistics, pd.DataFrame):
@@ -2894,11 +3299,11 @@ def plot_combined_summary(
             normal_fit_max_lag_seconds=normal_fit_max_lag_seconds,
         )
 
-    with _publication_style():
+    with _publication_style(plot_style):
         fig, axes_array = plt.subplots(
             1,
             len(panels),
-            figsize=(5.2 * len(panels), 6.5),
+            figsize=(5.8 * len(panels), 6.5),
             constrained_layout=True,
             facecolor="white",
         )
@@ -2911,13 +3316,15 @@ def plot_combined_summary(
                     msd_result,
                     show_individual_cells=False,
                     error_style=msd_error_style,
-                    scale="linear",
+                    scale=msd_scale,
+                    show_sample_counts=show_sample_counts,
+                    single_label_legend=single_label_legend,
                 )
                 ax.legend(
                     handles,
                     labels,
                     loc="upper left",
-                    fontsize=8.5,
+                    fontsize=12,
                     frameon=True,
                     edgecolor="black",
                 )
@@ -2934,12 +3341,47 @@ def plot_combined_summary(
                         and METRIC_SPECS[panel]["trajectory_metric"] is not None
                     ),
                     connect_paired_cells=connect_paired_cells,
-                    show_box=True,
+                    show_box=show_box,
+                    box_width=box_width,
+                    cap_width=cap_width,
+                    show_center_uncertainty=show_center_uncertainty,
+                    condition_spacing=condition_spacing,
                     log_scale=bool(METRIC_SPECS[panel]["default_log"]),
                     display_upper_percentile=display_upper_percentile,
                     statistics=statistics,
                     statistics_label_style=statistics_label_style,
                     show_legend=False,
+                    show_sample_counts=show_sample_counts,
+                )
+            if not show_panel_titles:
+                ax.set_title("")
+            if panel_ylabels is not None and panel in panel_ylabels:
+                ax.set_ylabel(str(panel_ylabels[panel]))
+        if "msd" in panels:
+            # The MSD panel carries an x-axis label below its tick numbers while
+            # the cell-metric panels end at their condition tick labels. Drop the
+            # condition labels onto the same text row so every panel ends level.
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            msd_axis = axes[list(panels).index("msd")]
+            target = msd_axis.xaxis.label.get_window_extent(renderer).y1
+            for ax, panel in zip(axes, panels):
+                if panel == "msd":
+                    continue
+                tick_labels = [
+                    text for text in ax.get_xticklabels() if text.get_text()
+                ]
+                if not tick_labels:
+                    continue
+                top = max(
+                    text.get_window_extent(renderer).y1 for text in tick_labels
+                )
+                ax.tick_params(
+                    axis="x",
+                    pad=(
+                        ax.xaxis.majorTicks[0].get_pad()
+                        + (top - target) * 72.0 / fig.dpi
+                    ),
                 )
         if output_directory is not None:
             _save_figure(
@@ -2956,8 +3398,8 @@ def plot_combined_summary(
 
 
 __all__ = [
-    "DEFAULT_RESULTS_ROOT",
     "analyze_final_results",
+    "build_channel_condition_summary",
     "build_channel_msd_summary",
     "compute_paired_channel_statistics",
     "fit_lag_seconds_from_frames",
@@ -2965,4 +3407,5 @@ __all__ = [
     "plot_channel_msd",
     "plot_combined_summary",
     "save_final_tables",
+    "summarize_spot_metrics",
 ]
