@@ -22,7 +22,7 @@ import pandas as pd
 import trackpy as tp
 from matplotlib import font_manager
 from matplotlib.lines import Line2D
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator, MultipleLocator
 from microlive import microscopy as mi
 from scipy.stats import linregress, ttest_rel, wilcoxon
 
@@ -37,7 +37,7 @@ _BASE_TABLE_FILENAMES = {
 }
 
 _CHANNEL_COLORS = (
-    "#00CC33",  # green (channel 0)
+    "#00C033",  # green (channel 0)
     "#FF00FF",  # magenta (channel 1)
     "#009E73",  # bluish green
     "#CC79A7",  # reddish purple
@@ -1273,12 +1273,12 @@ def _publication_style(
     settings = {
         "font.family": "sans-serif",
         "font.sans-serif": [font_name],
-        "font.size": 18,
+        "font.size": 20,
         "text.color": "black",
-        "axes.labelsize": 24,
+        "axes.labelsize": 26,
         "axes.labelweight": "semibold",
         "axes.labelcolor": "black",
-        "axes.titlesize": 22,
+        "axes.titlesize": 24,
         "axes.titleweight": "semibold",
         "axes.titlecolor": "black",
         "axes.edgecolor": "black",
@@ -1290,8 +1290,8 @@ def _publication_style(
         "savefig.facecolor": "white",
         "savefig.edgecolor": "white",
         "savefig.transparent": False,
-        "xtick.labelsize": 20,
-        "ytick.labelsize": 20,
+        "xtick.labelsize": 22,
+        "ytick.labelsize": 22,
         "xtick.color": "black",
         "ytick.color": "black",
         "xtick.direction": "out",
@@ -1304,7 +1304,7 @@ def _publication_style(
         "ytick.minor.size": 3,
         "xtick.minor.width": 1.0,
         "ytick.minor.width": 1.0,
-        "legend.fontsize": 15,
+        "legend.fontsize": 17,
         "legend.frameon": True,
         "legend.edgecolor": "black",
         "legend.facecolor": "white",
@@ -2479,7 +2479,7 @@ def _draw_significance_bracket(
         span = max(y_max - y_min, abs(y_max) * 0.1, 1e-12)
         y = y_max + 0.13 * span
         h = 0.045 * span
-        ax.set_ylim(top=max(ax.get_ylim()[1], y + h * 3.0))
+        ax.set_ylim(top=max(ax.get_ylim()[1], y + h * 4.5))
     ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", lw=1.3)
     ax.text(
         (x1 + x2) / 2,
@@ -2708,6 +2708,9 @@ def _draw_cell_metric_on_ax(
         ax.set_yscale("log")
     elif metric == "n_trajectories":
         ax.yaxis.set_major_locator(MaxNLocator(nbins=7, integer=True))
+    elif metric == "D_um2_s":
+        ax.yaxis.set_major_locator(MultipleLocator(0.01))
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     else:
         ax.yaxis.set_major_locator(MaxNLocator(nbins=7, min_n_ticks=5))
     ax.set_xticks(
