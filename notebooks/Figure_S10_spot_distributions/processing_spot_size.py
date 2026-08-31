@@ -194,6 +194,7 @@ def plot_cell_means_box_swarm(
     figsize=(6.5, 4.5),
     tick_size=18,
     max_percentile_significance=99.5,
+    significance_top_padding=0.035,
     save_formats=("png", "svg"),
     save_dpi=600,
 ):
@@ -301,12 +302,22 @@ def plot_cell_means_box_swarm(
             cap_height = 0.008 * axis_span
             text_offset = 0.005 * axis_span
             lowest_line = data_top + 0.025 * axis_span
-            highest_allowed = upper - cap_height - text_offset - 0.035 * axis_span
+            highest_allowed = (
+                upper
+                - cap_height
+                - text_offset
+                - significance_top_padding * axis_span
+            )
             number_of_bars = len(significant_pairs)
             level_spacing = 0.055 * axis_span
             if number_of_bars > 1:
-                required_top = lowest_line + level_spacing * (number_of_bars - 1)
-                if required_top > highest_allowed:
+                maximum_lowest_line = (
+                    highest_allowed - level_spacing * (number_of_bars - 1)
+                )
+                lowest_line = min(lowest_line, maximum_lowest_line)
+                minimum_lowest_line = lower + 0.10 * axis_span
+                if lowest_line < minimum_lowest_line:
+                    lowest_line = minimum_lowest_line
                     available = max(highest_allowed - lowest_line, 0)
                     level_spacing = available / (number_of_bars - 1)
             else:
@@ -338,7 +349,7 @@ def plot_cell_means_box_swarm(
             [x_left, x_left, x_right, x_right],
             [y_line, y_line + cap_height, y_line + cap_height, y_line],
             lw=1.25,
-            color="#222222",
+            color="black",
             solid_capstyle="round",
             solid_joinstyle="round",
             clip_on=True,
@@ -352,7 +363,7 @@ def plot_cell_means_box_swarm(
             va="bottom",
             fontsize=max(tick_size - 5, 10),
             fontweight="normal",
-            color="#111111",
+            color="black",
             bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.25},
             clip_on=True,
             zorder=5,
@@ -470,13 +481,22 @@ def plot_distributions(
     show_inset=False,
     inset_xlim=(0.45, 1.0),
     inset_bounds=(0.43, 0.46, 0.50, 0.34),
+    show_density_fill=True,
+    legend_inside=False,
+    show_tail_background=True,
+    show_inset_fill=True,
+    show_inset_title=True,
+    inset_title_size=11.5,
+    inset_tick_size=11.5,
     bins=60,
     save_formats=("png", "svg"),
     save_dpi=600,
 ):
-    """Plot KDE curves with an optional tail inset."""
+    """Plot KDE curves and return their observations and coordinates."""
     fig, ax = plt.subplots(figsize=figsize, facecolor="white")
     curves = []
+    observation_rows = []
+    curve_rows = []
 
     for result in distribution_results:
         key = result["condition_key"]
@@ -484,21 +504,27 @@ def plot_distributions(
         if values.size == 0:
             continue
 
+        observation_rows.extend({
+            "condition_key": key,
+            "value": value,
+        } for value in values)
+
         color = condition_colors[key]
         label = condition_labels[key]
         if values.size > 3 and np.nanstd(values) > 0:
             x_values = np.linspace(values.min(), values.max(), 900)
             try:
                 y_values = gaussian_kde(values, bw_method="scott")(x_values)
-                ax.fill_between(
-                    x_values,
-                    0,
-                    y_values,
-                    color=color,
-                    alpha=0.075,
-                    linewidth=0,
-                    zorder=1,
-                )
+                if show_density_fill:
+                    ax.fill_between(
+                        x_values,
+                        0,
+                        y_values,
+                        color=color,
+                        alpha=0.075,
+                        linewidth=0,
+                        zorder=1,
+                    )
                 ax.plot(
                     x_values,
                     y_values,
@@ -522,6 +548,12 @@ def plot_distributions(
                     zorder=2,
                 )
                 curves.append((x_values, y_values, color))
+                curve_rows.extend({
+                    "condition_key": key,
+                    "x_value": x_value,
+                    "probability_density": y_value,
+                    "n_observations": int(values.size),
+                } for x_value, y_value in zip(x_values, y_values))
             except np.linalg.LinAlgError:
                 ax.hist(
                     values,
@@ -543,8 +575,10 @@ def plot_distributions(
                 label=label,
             )
 
-    ax.set_xlabel(x_label, fontsize=22, labelpad=6)
-    ax.set_ylabel("Probability Density", fontsize=22, labelpad=6)
+    ax.set_xlabel(x_label, fontsize=22, labelpad=6, color="black")
+    ax.set_ylabel(
+        "Probability Density", fontsize=22, labelpad=6, color="black"
+    )
     ax.tick_params(
         axis="both",
         which="major",
@@ -552,48 +586,64 @@ def plot_distributions(
         width=1.5,
         length=6,
         direction="out",
-        colors="#222222",
+        colors="black",
     )
     ax.set_ylim(bottom=0)
     if xlim is not None:
         ax.set_xlim(xlim)
     for spine in ax.spines.values():
         spine.set_linewidth(1.5)
-        spine.set_color("#222222")
+        spine.set_color("black")
 
-    ax.legend(
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.025),
-        ncol=len(condition_labels),
-        frameon=False,
-        fontsize=14.5,
-        handlelength=2.5,
-        handletextpad=0.7,
-        columnspacing=1.45,
-        borderaxespad=0,
-    )
+    if legend_inside:
+        ax.legend(
+            loc="lower right",
+            bbox_to_anchor=(0.985, 0.08),
+            ncol=1,
+            frameon=False,
+            fontsize=13.0,
+            handlelength=2.25,
+            handletextpad=0.65,
+            labelspacing=0.42,
+            borderpad=0,
+            borderaxespad=0,
+        )
+    else:
+        ax.legend(
+            loc="lower center",
+            bbox_to_anchor=(0.5, 1.025),
+            ncol=len(condition_labels),
+            frameon=False,
+            fontsize=14.5,
+            handlelength=2.5,
+            handletextpad=0.7,
+            columnspacing=1.45,
+            borderaxespad=0,
+        )
 
     if show_inset and curves:
-        ax.axvspan(
-            inset_xlim[0],
-            inset_xlim[1],
-            color="#6B7280",
-            alpha=0.025,
-            linewidth=0,
-            zorder=0,
-        )
+        if show_tail_background:
+            ax.axvspan(
+                inset_xlim[0],
+                inset_xlim[1],
+                color="#6B7280",
+                alpha=0.025,
+                linewidth=0,
+                zorder=0,
+            )
         inset_ax = ax.inset_axes(inset_bounds)
-        inset_ax.set_facecolor("#FAFAFA")
+        inset_ax.set_facecolor("white")
         inset_y_values = []
         for x_values, y_values, color in curves:
-            inset_ax.fill_between(
-                x_values,
-                0,
-                y_values,
-                color=color,
-                alpha=0.055,
-                linewidth=0,
-            )
+            if show_inset_fill:
+                inset_ax.fill_between(
+                    x_values,
+                    0,
+                    y_values,
+                    color=color,
+                    alpha=0.055,
+                    linewidth=0,
+                )
             inset_ax.plot(
                 x_values,
                 y_values,
@@ -610,38 +660,40 @@ def plot_distributions(
             y_min = min(inset_y_values)
             y_max = max(inset_y_values)
             padding = 0.08 * max(y_max - y_min, y_max, 1e-9)
-            inset_ax.set_ylim(max(0, y_min - padding), y_max + padding)
-        inset_ax.set_title(
-            rf"Tail: {inset_xlim[0]:g}–{inset_xlim[1]:g} $\mu$m",
-            fontsize=11.5,
-            pad=4,
-            color="#333333",
-        )
+            inset_ax.set_ylim(y_min - padding, y_max + padding)
+        if show_inset_title:
+            inset_ax.set_title(
+                rf"Tail: {inset_xlim[0]:g}–{inset_xlim[1]:g} $\mu$m",
+                fontsize=inset_title_size,
+                pad=4,
+                color="black",
+            )
         inset_ax.set_yticks([])
         inset_ax.set_xticks(np.linspace(inset_xlim[0], inset_xlim[1], 3))
         inset_ax.tick_params(
             axis="x",
-            labelsize=11.5,
+            labelsize=inset_tick_size,
             width=1.0,
             length=3.5,
             direction="out",
-            colors="#333333",
+            colors="black",
         )
         for spine in inset_ax.spines.values():
             spine.set_visible(True)
-            spine.set_linewidth(0.9)
-            spine.set_color("#A7A7A7")
+            spine.set_linewidth(1.5)
+            spine.set_color("black")
 
     fig.tight_layout(pad=1.15)
     _save_figure(
         fig,
         output_dir,
-        f"{plot_stem}_mode{mode}",
+        plot_stem,
         save_formats,
         save_dpi,
     )
     plt.show()
     plt.close(fig)
+    return pd.DataFrame(observation_rows), pd.DataFrame(curve_rows)
 
 
 def summarize_spots_above_threshold(

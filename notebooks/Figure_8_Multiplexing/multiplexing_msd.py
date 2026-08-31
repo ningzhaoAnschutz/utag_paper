@@ -55,9 +55,9 @@ _FINAL_TABLE_FILENAMES = {
 
 METRIC_SPECS = {
     "D_um2_s": {
-        "label": "Diffusion coefficient, D (µm²/s)",
+        "label": r"Diffusion coefficient, D ($\mu$m$^2$/s)",
         "title": "Normal diffusion",
-        "unit": "µm²/s",
+        "unit": r"$\mu$m$^2$/s",
         "trajectory_metric": None,
         "default_log": False,
         "zero_baseline": True,
@@ -71,9 +71,9 @@ METRIC_SPECS = {
         "zero_baseline": True,
     },
     "K_alpha_um2_s_alpha": {
-        "label": "Generalized diffusion coefficient, Kα (µm²/s^α)",
+        "label": r"Generalized diffusion coefficient, Kα ($\mu$m$^2$/s$^α$)",
         "title": "Anomalous generalized diffusion",
-        "unit": "µm²/s^α",
+        "unit": r"$\mu$m$^2$/s$^α$",
         "trajectory_metric": None,
         "default_log": True,
         "zero_baseline": False,
@@ -95,9 +95,9 @@ METRIC_SPECS = {
         "zero_baseline": True,
     },
     "cell_spot_fwhm_um": {
-        "label": "Mean spot FWHM (µm)",
+        "label": r"Mean spot FWHM ($\mu$m)",
         "title": "Spot size",
-        "unit": "µm",
+        "unit": r"$\mu$m",
         "trajectory_metric": "trajectory_spot_fwhm_um",
         "default_log": False,
         "zero_baseline": False,
@@ -1304,7 +1304,7 @@ def _publication_style(
         "ytick.minor.size": 3,
         "xtick.minor.width": 1.0,
         "ytick.minor.width": 1.0,
-        "legend.fontsize": 17,
+        "legend.fontsize": 22,
         "legend.frameon": True,
         "legend.edgecolor": "black",
         "legend.facecolor": "white",
@@ -2938,6 +2938,7 @@ def _draw_channel_msd_on_ax(
     scale: str,
     show_sample_counts: bool,
     single_label_legend: bool = True,
+    show_diffusion_coefficient: bool = False,
 ) -> tuple[list[Any], list[str]]:
     """Draw channel-level MSD curves, uncertainty, and optional fits."""
     summary = msd_result["plot_summary"]
@@ -3048,7 +3049,10 @@ def _draw_channel_msd_on_ax(
             )
             d_val = float(fit_row["D_group_curve_um2_s"])
             if single_label_legend:
-                legend_labels.append(f"{labels[channel]} (D={d_val:.2e} µm²/s)")
+                if show_diffusion_coefficient:
+                    legend_labels.append(f"{labels[channel]} (D={d_val:.2e} µm²/s)")
+                else:
+                    legend_labels.append(f"{labels[channel]}")
             else:
                 summary_label = _summary_legend_label(center, uncertainty)
                 if show_sample_counts:
@@ -3068,8 +3072,8 @@ def _draw_channel_msd_on_ax(
         else:
             legend_labels.append(f"{labels[channel]}")
 
-    ax.set_xlabel("Time lag (s)")
-    ax.set_ylabel("MSD (µm²)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(r"MSD ($\mu$m$^2$)")
     ax.set_title(f"{center.title()} MSD across paired cell samples", pad=13)
     ax.set_facecolor("white")
     ax.grid(False, which="both")
@@ -3107,6 +3111,7 @@ def plot_channel_msd(
     legend_position: str | None = "top",
     figsize: tuple[float, float] | None = None,
     show_sample_counts: bool = True,
+    show_diffusion_coefficient: bool = False,
     show_title: bool = True,
     plot_style: Mapping[str, Any] | None = None,
     output_directory: str | Path | None = None,
@@ -3164,6 +3169,7 @@ def plot_channel_msd(
             error_style=error_style,
             scale=scale,
             show_sample_counts=show_sample_counts,
+            show_diffusion_coefficient=show_diffusion_coefficient,
         )
         if not show_title:
             ax.set_title("")
@@ -3400,8 +3406,167 @@ def plot_combined_summary(
     return fig, axes
 
 
+def build_figure_8_def_source_tables(
+    analysis: Mapping[str, Any],
+    *,
+    channels: Sequence[int] = (0, 1),
+    canonical_condition_labels: Mapping[int, str] | None = None,
+    normal_fit_max_lag_seconds: float,
+) -> dict[str, pd.DataFrame]:
+    """Build the minimal source-data tables for manuscript Figure 8D-F."""
+    selected_channels = [int(channel) for channel in channels]
+    if len(selected_channels) != 2:
+        raise ValueError("Figure 8D-F requires exactly two paired channels.")
+    labels = (
+        {0: "SunTag", 1: "UTag_DeltaCys"}
+        if canonical_condition_labels is None
+        else {
+            int(channel): str(label)
+            for channel, label in canonical_condition_labels.items()
+        }
+    )
+    missing_labels = sorted(set(selected_channels).difference(labels))
+    if missing_labels:
+        raise ValueError(
+            f"Canonical condition labels are missing channels: {missing_labels}."
+        )
+
+    cell_analysis = analysis["cell_analysis_summary"]
+    cell_ids = sorted(cell_analysis["global_cell_id"].dropna().unique())
+    anonymous_cell_ids = {
+        cell_id: f"cell_{index:03d}"
+        for index, cell_id in enumerate(cell_ids, start=1)
+    }
+
+    trajectory_counts = _metric_valid_rows(cell_analysis, "n_trajectories")
+    trajectory_counts = trajectory_counts[
+        trajectory_counts["channel"].isin(selected_channels)
+    ].copy()
+    trajectory_counts["condition"] = trajectory_counts["channel"].map(labels)
+    trajectory_counts["cell_id"] = trajectory_counts["global_cell_id"].map(
+        anonymous_cell_ids
+    )
+    figure_8d = (
+        trajectory_counts[
+            ["condition", "cell_id", "n_trajectories"]
+        ]
+        .rename(columns={"n_trajectories": "number_of_trajectories"})
+        .sort_values(["condition", "cell_id"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+    diffusion = _metric_valid_rows(cell_analysis, "D_um2_s")
+    diffusion = diffusion[diffusion["channel"].isin(selected_channels)].copy()
+    diffusion["condition"] = diffusion["channel"].map(labels)
+    diffusion["cell_id"] = diffusion["global_cell_id"].map(anonymous_cell_ids)
+    figure_8e = (
+        diffusion[["condition", "cell_id", "D_um2_s"]]
+        .rename(columns={"D_um2_s": "diffusion_coefficient_um2_s"})
+        .sort_values(["condition", "cell_id"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+    msd_result = build_channel_msd_summary(
+        analysis,
+        channels=selected_channels,
+        center="mean",
+        uncertainty="sem",
+        paired_cells_only=True,
+        require_valid_normal_fit=True,
+        normal_fit_max_lag_seconds=normal_fit_max_lag_seconds,
+    )
+    msd_summary = msd_result["summary"].copy()
+    msd_summary["condition"] = msd_summary["channel"].map(labels)
+    figure_8f_summary = (
+        msd_summary[
+            [
+                "condition",
+                "lag_seconds",
+                "mean_msd_um2",
+                "sem_msd_um2",
+                "n_cells",
+            ]
+        ]
+        .rename(
+            columns={
+                "lag_seconds": "time_s",
+                "n_cells": "n_paired_cells",
+            }
+        )
+        .sort_values(["condition", "time_s"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+    fit_summary = msd_result["fit_summary"].copy()
+    fit_summary["condition"] = fit_summary["channel"].map(labels)
+    figure_8f_fit = (
+        fit_summary[
+            [
+                "condition",
+                "fit_points",
+                "fit_lag_start_s",
+                "fit_lag_end_s",
+                "dimension_factor",
+                "D_group_curve_um2_s",
+                "slope_um2_s",
+                "offset_um2",
+                "r_squared",
+            ]
+        ]
+        .rename(
+            columns={
+                "fit_points": "n_fit_points",
+                "D_group_curve_um2_s": (
+                    "group_curve_diffusion_coefficient_um2_s"
+                ),
+            }
+        )
+        .sort_values("condition", kind="stable")
+        .reset_index(drop=True)
+    )
+
+    if figure_8d.duplicated(["condition", "cell_id"]).any():
+        raise ValueError("Figure 8D source data are not unique per cell/condition.")
+    if figure_8e.duplicated(["condition", "cell_id"]).any():
+        raise ValueError("Figure 8E source data are not unique per cell/condition.")
+    if figure_8f_summary.duplicated(["condition", "time_s"]).any():
+        raise ValueError("Figure 8F summary is not unique per condition/time.")
+    return {
+        "Figure_8D_trajectories_per_cell_individual_values.csv": figure_8d,
+        "Figure_8E_diffusion_coefficient_individual_values.csv": figure_8e,
+        "Figure_8F_MSD_timepoint_summary.csv": figure_8f_summary,
+        "Figure_8F_MSD_normal_fit_parameters.csv": figure_8f_fit,
+    }
+
+
+def save_figure_8_def_source_tables(
+    analysis: Mapping[str, Any],
+    output_directory: str | Path,
+    *,
+    channels: Sequence[int] = (0, 1),
+    canonical_condition_labels: Mapping[int, str] | None = None,
+    normal_fit_max_lag_seconds: float,
+) -> dict[str, Path]:
+    """Save Figure 8D-F source tables without recalculating the analysis."""
+    tables = build_figure_8_def_source_tables(
+        analysis,
+        channels=channels,
+        canonical_condition_labels=canonical_condition_labels,
+        normal_fit_max_lag_seconds=normal_fit_max_lag_seconds,
+    )
+    output = Path(output_directory).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    written = {}
+    for filename, table in tables.items():
+        path = output / filename
+        table.to_csv(path, index=False)
+        written[filename] = path
+    return written
+
+
 __all__ = [
     "analyze_final_results",
+    "build_figure_8_def_source_tables",
     "build_channel_condition_summary",
     "build_channel_msd_summary",
     "compute_paired_channel_statistics",
@@ -3409,6 +3574,7 @@ __all__ = [
     "plot_cell_metric",
     "plot_channel_msd",
     "plot_combined_summary",
+    "save_figure_8_def_source_tables",
     "save_final_tables",
     "summarize_spot_metrics",
 ]

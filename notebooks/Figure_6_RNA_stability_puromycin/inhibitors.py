@@ -1105,6 +1105,7 @@ def plot_multiple_inhibitors(full_frames_list,
                                 results_folder=None,
                                 plot_name='HT_multi',
                                 responding_indices_list=None,
+                                source_data_collector=None,
                                 figsize=(6, 3),
                                 colors=None,
                                 legend_labels=None,
@@ -1164,6 +1165,10 @@ def plot_multiple_inhibitors(full_frames_list,
             ``HT_`` for backward compatibility.
         responding_indices_list: Per-dataset lists of cell indices to include.
             Defaults to all.
+        source_data_collector: Optional list that receives one dictionary per
+            plotted dataset containing the exact time, mean, error, sample-size,
+            and dense fitted-curve arrays used to draw the figure. This is for
+            publication source-data export and does not alter calculations.
         figsize: Figure size tuple.
         colors: Matplotlib color codes for each dataset.
         legend_labels: Text labels for each dataset's mean trace.
@@ -1339,13 +1344,31 @@ def plot_multiple_inhibitors(full_frames_list,
         # Compute mean & error (NaN-safe for artifact-removed frames)
         data = intensities[resp_idx, :]
         mean_traj = np.nanmean(data, axis=0)
-        std_traj  = np.nanstd(data, axis=0)
         if use_sem:
             n_valid = np.sum(np.isfinite(data), axis=0)
-            n_valid = np.maximum(n_valid, 1)
-            err_traj = std_traj / np.sqrt(n_valid)
+            squared_deviations = np.nansum(
+                (data - mean_traj) ** 2,
+                axis=0,
+            )
+            sample_variance = np.divide(
+                squared_deviations,
+                n_valid - 1,
+                out=np.full_like(mean_traj, np.nan, dtype=float),
+                where=n_valid > 1,
+            )
+            std_traj = np.sqrt(sample_variance)
+            err_traj = np.divide(
+                std_traj,
+                np.sqrt(n_valid),
+                out=np.full_like(std_traj, np.nan, dtype=float),
+                where=n_valid > 1,
+            )
         else:
+            std_traj = np.nanstd(data, axis=0)
             err_traj = std_traj
+
+        fit_x_export = np.asarray([], dtype=float)
+        fit_y_export = np.asarray([], dtype=float)
 
         # Determine legend text
         condition_label_text = (legend_labels[idx]
@@ -1533,6 +1556,8 @@ def plot_multiple_inhibitors(full_frames_list,
                                 color=color, linewidth=fit_line_width, alpha=0.9,
                                 solid_capstyle='round', zorder=1,
                                 label='_nolegend_')
+                        fit_x_export = np.asarray(fit_x / time_scale, dtype=float).copy()
+                        fit_y_export = np.asarray(fit_y, dtype=float).copy()
 
                     # Same-color extrapolation for linear_extrapolated
                     if fit_result['model'] == 'linear_extrapolated' and len(fit_x) > 0:
@@ -1569,6 +1594,25 @@ def plot_multiple_inhibitors(full_frames_list,
             fit_results.append(fit_result)
         else:
             fit_results.append(None)
+
+        if source_data_collector is not None:
+            n_cells_total = (
+                n_cells_override[idx]
+                if n_cells_override and idx < len(n_cells_override)
+                else len(resp_idx)
+            )
+            source_data_collector.append({
+                'dataset_index': idx,
+                'condition_label': condition_label_text,
+                'time': np.asarray(frames_display, dtype=float).copy(),
+                'mean': np.asarray(mean_traj, dtype=float).copy(),
+                'error': np.asarray(err_traj, dtype=float).copy(),
+                'error_type': 'sem' if use_sem else 'sd',
+                'n_cells_total': int(n_cells_total),
+                'n_independent_units': int(len(resp_idx)),
+                'fit_time': fit_x_export,
+                'fit_value': fit_y_export,
+            })
 
     # Plot treatment line at zero
     if show_treatment_line:
@@ -2387,16 +2431,27 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
     """
 
     list_dataframes = []
-    subfolders = [folder for folder in data_dir.iterdir() if folder.is_dir()]
-    subfolders = [folder for folder in subfolders if folder.name.startswith('results_') and substring_in_data_dir in folder.name]
+    subfolders = sorted(
+        folder for folder in data_dir.iterdir()
+        if (folder.is_dir()
+            and folder.name.startswith('results_')
+            and substring_in_data_dir in folder.name)
+    )
     if verbose:
         print('List of processed dataframes:')
     for subfolder in subfolders:
-        files = [f for f in subfolder.iterdir() if f.is_file() and 'tracking_' in f.name and f.suffix == '.csv']
-        if not files:
-            if verbose:
-                print(f'Warning: No tracking CSV found in {subfolder.name}, skipping.')
-            continue
+        files = sorted(
+            f for f in subfolder.iterdir()
+            if (f.is_file()
+                and f.name.startswith('tracking_')
+                and not f.name.startswith('._')
+                and f.suffix.lower() == '.csv')
+        )
+        if len(files) != 1:
+            raise ValueError(
+                f'{subfolder.name} must contain exactly one real tracking_*.csv '
+                f'file after excluding AppleDouble sidecars; found {len(files)}.'
+            )
         dfs = pd.read_csv(files[0])
         list_dataframes.append(dfs)
         if verbose:
