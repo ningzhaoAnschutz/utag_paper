@@ -2939,6 +2939,7 @@ def _draw_channel_msd_on_ax(
     show_sample_counts: bool,
     single_label_legend: bool = True,
     show_diffusion_coefficient: bool = False,
+    show_fit_lines: bool = True,
 ) -> tuple[list[Any], list[str]]:
     """Draw channel-level MSD curves, uncertainty, and optional fits."""
     summary = msd_result["plot_summary"]
@@ -3031,7 +3032,7 @@ def _draw_channel_msd_on_ax(
             if "channel" in fit_summary.columns
             else pd.DataFrame()
         )
-        if not fit.empty:
+        if not fit.empty and show_fit_lines:
             fit_row = fit.iloc[0]
             x_fit = np.linspace(
                 float(fit_row["fit_lag_start_s"]),
@@ -3070,7 +3071,23 @@ def _draw_channel_msd_on_ax(
                     f"{labels[channel]} normal fit: D={d_val:.2e} µm²/s"
                 )
         else:
-            legend_labels.append(f"{labels[channel]}")
+            if single_label_legend:
+                if show_diffusion_coefficient and not fit.empty:
+                    d_val = float(fit.iloc[0]["D_group_curve_um2_s"])
+                    legend_labels.append(f"{labels[channel]} (D={d_val:.2e} µm²/s)")
+                else:
+                    legend_labels.append(f"{labels[channel]}")
+            else:
+                summary_label = _summary_legend_label(center, uncertainty)
+                if show_sample_counts:
+                    n_min = int(data["n_cells"].min())
+                    n_max = int(data["n_cells"].max())
+                    n_text = f"n={n_min}" if n_min == n_max else f"n={n_min}–{n_max}"
+                    legend_labels.append(
+                        f"{labels[channel]}: {summary_label} ({n_text} cells)"
+                    )
+                else:
+                    legend_labels.append(f"{labels[channel]}: {summary_label}")
 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(r"MSD ($\mu$m$^2$)")
@@ -3103,6 +3120,7 @@ def plot_channel_msd(
     paired_cells_only: bool = True,
     require_valid_normal_fit: bool = True,
     show_individual_cells: bool = False,
+    show_fit_lines: bool = True,
     error_style: str = "bars",
     scale: str = "linear",
     maximum_display_lag_seconds: float | None = None,
@@ -3170,6 +3188,7 @@ def plot_channel_msd(
             scale=scale,
             show_sample_counts=show_sample_counts,
             show_diffusion_coefficient=show_diffusion_coefficient,
+            show_fit_lines=show_fit_lines,
         )
         if not show_title:
             ax.set_title("")
@@ -3259,6 +3278,7 @@ def plot_combined_summary(
     display_upper_percentile: float | None = 95.0,
     msd_error_style: str = "band",
     msd_scale: str = "linear",
+    msd_show_fit_lines: bool = True,
     maximum_display_lag_seconds: float | None = None,
     normal_fit_max_lag_seconds: float | None = None,
     single_label_legend: bool = True,
@@ -3328,6 +3348,7 @@ def plot_combined_summary(
                     scale=msd_scale,
                     show_sample_counts=show_sample_counts,
                     single_label_legend=single_label_legend,
+                    show_fit_lines=msd_show_fit_lines,
                 )
                 ax.legend(
                     handles,
