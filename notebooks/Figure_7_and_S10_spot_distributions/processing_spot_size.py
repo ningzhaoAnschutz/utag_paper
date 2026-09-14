@@ -14,12 +14,17 @@ from scipy.stats import gaussian_kde, mannwhitneyu
 __all__ = [
     "build_audit_dataframe",
     "extract_cell_arrays",
+    "extract_particle_means_by_cell",
     "extract_particle_distribution",
     "extract_spots_per_cell",
     "load_tracking_records",
     "plot_cell_means_box_swarm",
     "plot_distributions",
     "summarize_spots_above_threshold",
+    "run_distribution_analyses",
+    "run_large_spot_analysis",
+    "run_whisker_analyses",
+    "save_pairwise_statistics",
 ]
 
 
@@ -144,28 +149,124 @@ def extract_cell_arrays(
     selected_field,
     selected_frame=None,
     convert_pixels_to_um=False,
+    max_spot_size_um=None,
+    channel_index=0,
 ):
-    """Return one array per cell for every condition."""
+    """Return one array per cell for every condition, optionally filtered by spot size."""
     condition_arrays = []
+    size_field = f"spot_size_ch_{channel_index}"
     for key in condition_keys:
         cell_arrays = []
         for record in tracking_records[key]:
             dataframe = record["dataframe"]
             if selected_field not in dataframe.columns:
                 raise KeyError(f"{selected_field} missing from {record['tracking_file']}")
-            if selected_frame is not None and "frame" in dataframe.columns:
-                values = dataframe.loc[
-                    dataframe["frame"] == selected_frame,
-                    selected_field,
-                ].to_numpy(dtype=float)
-            else:
-                values = dataframe[selected_field].to_numpy(dtype=float)
-            values = values[np.isfinite(values)]
+            if max_spot_size_um is not None and size_field not in dataframe.columns:
+                raise KeyError(f"{size_field} missing from {record['tracking_file']}")
+
+            sub_df = dataframe
+            if selected_frame is not None and "frame" in sub_df.columns:
+                sub_df = sub_df.loc[sub_df["frame"] == selected_frame]
+
+            values = sub_df[selected_field].to_numpy(dtype=float)
+            valid_mask = np.isfinite(values)
+
+            if max_spot_size_um is not None:
+                spot_size_um = (
+                    sub_df[size_field].to_numpy(dtype=float)
+                    * record["pixel_size_um"]
+                )
+                valid_mask = (
+                    valid_mask
+                    & np.isfinite(spot_size_um)
+                    & (spot_size_um <= max_spot_size_um)
+                )
+
+            values = values[valid_mask]
             if convert_pixels_to_um:
                 values = values * record["pixel_size_um"]
             cell_arrays.append(values)
         condition_arrays.append(cell_arrays)
     return condition_arrays
+
+
+def extract_particle_means_by_cell(
+    tracking_records,
+    condition_keys,
+    selected_field,
+    max_particle_mean_size_um,
+    selected_frame=None,
+    convert_pixels_to_um=False,
+    channel_index=0,
+    min_snr=None,
+):
+    """Return equally weighted particle means per cell after a size filter.
+
+    Particle eligibility is determined from its mean spot size across valid
+    frames. The returned arrays contain one mean selected-field value per
+    eligible particle, so a later cell mean gives every particle equal weight.
+    """
+    condition_arrays = []
+    size_field = f"spot_size_ch_{channel_index}"
+    snr_field = f"snr_ch_{channel_index}"
+
+    for key in condition_keys:
+        cell_arrays = []
+        for record in tracking_records[key]:
+            dataframe = record["dataframe"]
+            required_fields = {selected_field, size_field}
+            missing_fields = required_fields.difference(dataframe.columns)
+            if missing_fields:
+                missing_text = ", ".join(sorted(missing_fields))
+                raise KeyError(
+                    f"{missing_text} missing from {record['tracking_file']}"
+                )
+
+            sub_df = dataframe
+            if selected_frame is not None and "frame" in sub_df.columns:
+                sub_df = sub_df.loc[sub_df["frame"] == selected_frame]
+
+            particle_column = _particle_column(sub_df)
+            if particle_column not in sub_df.columns:
+                raise KeyError(
+                    f"Tracked-particle identifier missing from "
+                    f"{record['tracking_file']}"
+                )
+
+            spot_size_um = (
+                sub_df[size_field].to_numpy(dtype=float)
+                * record["pixel_size_um"]
+            )
+            selected_values = sub_df[selected_field].to_numpy(dtype=float)
+            if convert_pixels_to_um:
+                selected_values = selected_values * record["pixel_size_um"]
+
+            valid_mask = np.isfinite(spot_size_um) & (spot_size_um > 0)
+            if min_snr is not None and snr_field in sub_df.columns:
+                snr_values = sub_df[snr_field].to_numpy(dtype=float)
+                valid_mask &= np.isfinite(snr_values) & (snr_values >= min_snr)
+
+            particle_frame_values = pd.DataFrame({
+                "particle": sub_df[particle_column].to_numpy()[valid_mask],
+                "spot_size_um": spot_size_um[valid_mask],
+                "selected_value": selected_values[valid_mask],
+            })
+            particle_summary = (
+                particle_frame_values.groupby("particle", sort=False)
+                .agg(
+                    mean_spot_size_um=("spot_size_um", "mean"),
+                    mean_selected_value=("selected_value", "mean"),
+                )
+            )
+            eligible_values = particle_summary.loc[
+                particle_summary["mean_spot_size_um"]
+                <= max_particle_mean_size_um,
+                "mean_selected_value",
+            ].to_numpy(dtype=float)
+            cell_arrays.append(eligible_values[np.isfinite(eligible_values)])
+        condition_arrays.append(cell_arrays)
+    return condition_arrays
+
 
 
 def _significance_label(p_value):
@@ -392,10 +493,12 @@ def extract_particle_distribution(
     min_snr=0.0,
     timepoint_frame=None,
     convert_pixels_to_um=False,
+    max_spot_size_um=None,
 ):
     """Extract existing CSV values in three modes without pixel recalculation."""
     value_column = f"{selected_field_prefix}{channel_index}"
     snr_column = f"snr_ch_{channel_index}"
+    size_column = f"spot_size_ch_{channel_index}"
     results = []
 
     for key in condition_keys:
@@ -409,6 +512,8 @@ def extract_particle_distribution(
             dataframe = record["dataframe"].copy()
             if value_column not in dataframe.columns:
                 raise KeyError(f"{value_column} missing from {record['tracking_file']}")
+            if max_spot_size_um is not None and size_column not in dataframe.columns:
+                raise KeyError(f"{size_column} missing from {record['tracking_file']}")
             if snr_column in dataframe.columns:
                 dataframe = dataframe.loc[dataframe[snr_column] >= min_snr].copy()
             dataframe = dataframe.loc[
@@ -417,22 +522,50 @@ def extract_particle_distribution(
             if dataframe.empty:
                 continue
 
+            size_um = (
+                dataframe[size_column].astype(float) * record["pixel_size_um"]
+                if max_spot_size_um is not None
+                else None
+            )
             if convert_pixels_to_um:
                 dataframe[value_column] = (
                     dataframe[value_column].astype(float) * record["pixel_size_um"]
                 )
 
             particle_column = _particle_column(dataframe)
-            if particle_column in dataframe.columns:
-                means = dataframe.groupby(particle_column)[value_column].mean()
-                mean_per_particle.extend(means.to_list())
-            else:
-                mean_per_particle.append(dataframe[value_column].mean())
+            if max_spot_size_um is not None:
+                if particle_column in dataframe.columns:
+                    particle_size_um = size_um.groupby(
+                        dataframe[particle_column]
+                    ).mean()
+                    valid_particles = set(
+                        particle_size_um[particle_size_um <= max_spot_size_um].index
+                    )
+                    means = dataframe.groupby(particle_column)[value_column].mean()
+                    means = means[means.index.isin(valid_particles)]
+                    mean_per_particle.extend(means.to_list())
+                else:
+                    if size_um.mean() <= max_spot_size_um:
+                        mean_per_particle.append(dataframe[value_column].mean())
 
-            all_timepoints.extend(dataframe[value_column].to_list())
-            if "frame" in dataframe.columns:
-                valid_frames.extend(dataframe["frame"].to_list())
-            prepared_records.append(dataframe)
+                valid_obs = dataframe.loc[size_um <= max_spot_size_um, value_column]
+                all_timepoints.extend(valid_obs.to_list())
+                if "frame" in dataframe.columns:
+                    valid_frames.extend(
+                        dataframe.loc[size_um <= max_spot_size_um, "frame"].to_list()
+                    )
+                prepared_records.append(dataframe.loc[size_um <= max_spot_size_um])
+            else:
+                if particle_column in dataframe.columns:
+                    means = dataframe.groupby(particle_column)[value_column].mean()
+                    mean_per_particle.extend(means.to_list())
+                else:
+                    mean_per_particle.append(dataframe[value_column].mean())
+
+                all_timepoints.extend(dataframe[value_column].to_list())
+                if "frame" in dataframe.columns:
+                    valid_frames.extend(dataframe["frame"].to_list())
+                prepared_records.append(dataframe)
 
         selected_timepoint = (
             int(np.median(valid_frames))
@@ -488,6 +621,8 @@ def plot_distributions(
     show_inset_title=True,
     inset_title_size=11.5,
     inset_tick_size=11.5,
+    tick_size=19,
+    spine_linewidth=2.0,
     bins=60,
     save_formats=("png", "svg"),
     save_dpi=600,
@@ -582,8 +717,8 @@ def plot_distributions(
     ax.tick_params(
         axis="both",
         which="major",
-        labelsize=17,
-        width=1.5,
+        labelsize=tick_size,
+        width=spine_linewidth,
         length=6,
         direction="out",
         colors="black",
@@ -592,7 +727,7 @@ def plot_distributions(
     if xlim is not None:
         ax.set_xlim(xlim)
     for spine in ax.spines.values():
-        spine.set_linewidth(1.5)
+        spine.set_linewidth(spine_linewidth)
         spine.set_color("black")
 
     if legend_inside:
@@ -607,6 +742,7 @@ def plot_distributions(
             labelspacing=0.42,
             borderpad=0,
             borderaxespad=0,
+            labelcolor="black",
         )
     else:
         ax.legend(
@@ -618,7 +754,9 @@ def plot_distributions(
             handlelength=2.5,
             handletextpad=0.7,
             columnspacing=1.45,
+            borderpad=0,
             borderaxespad=0,
+            labelcolor="black",
         )
 
     if show_inset and curves:
@@ -673,14 +811,14 @@ def plot_distributions(
         inset_ax.tick_params(
             axis="x",
             labelsize=inset_tick_size,
-            width=1.0,
+            width=max(1.0, spine_linewidth - 0.5),
             length=3.5,
             direction="out",
             colors="black",
         )
         for spine in inset_ax.spines.values():
             spine.set_visible(True)
-            spine.set_linewidth(1.5)
+            spine.set_linewidth(spine_linewidth)
             spine.set_color("black")
 
     fig.tight_layout(pad=1.15)
@@ -755,3 +893,535 @@ def extract_spots_per_cell(tracking_records, condition_keys):
             repetitions.append(np.array([count], dtype=float))
         conditions.append(repetitions)
     return conditions
+
+
+# Figure S10 orchestration and source-data export
+
+def _holm_adjust(p_values):
+    """Return Holm-adjusted p-values while preserving missing values."""
+    p_values = np.asarray(p_values, dtype=float)
+    adjusted = np.full(p_values.shape, np.nan, dtype=float)
+    finite_indices = np.flatnonzero(np.isfinite(p_values))
+    if not finite_indices.size:
+        return adjusted
+
+    finite_p_values = p_values[finite_indices]
+    order = np.argsort(finite_p_values)
+    sorted_p_values = finite_p_values[order]
+    multipliers = len(sorted_p_values) - np.arange(len(sorted_p_values))
+    adjusted_sorted = np.maximum.accumulate(multipliers * sorted_p_values)
+    adjusted_sorted = np.minimum(adjusted_sorted, 1.0)
+    adjusted[finite_indices[order]] = adjusted_sorted
+    return adjusted
+
+
+def _display_to_export_map(condition_keys, display_labels, export_labels):
+    """Map plot labels to CSV-safe labels."""
+    return {
+        display_labels[key]: export_labels[key]
+        for key in condition_keys
+    }
+
+
+def _export_cell_source(
+    plot_df,
+    value_column,
+    output_path,
+    display_to_export,
+):
+    """Export one row per cell from a box-and-whisker plot."""
+    source_df = (
+        plot_df.assign(
+            condition=plot_df["Condition"].map(display_to_export)
+        )
+        .rename(columns={"Mean": value_column})
+        [["condition", value_column]]
+    )
+    if source_df["condition"].isna().any():
+        raise ValueError(f"Unmapped condition label while exporting {output_path}")
+    source_df.to_csv(output_path, index=False)
+    print(f"Saved: {output_path}")
+    return source_df
+
+
+def _format_pairwise_statistics(
+    pvalue_df,
+    plot_stem,
+    display_to_export,
+    show_stats,
+):
+    """Create an export table containing raw and Holm-adjusted p-values."""
+    comparison_parts = pvalue_df["comparison"].str.split(
+        " vs ", n=1, expand=True
+    )
+    raw_p_values = pvalue_df["p_value"].to_numpy(dtype=float)
+    adjusted_p_values = _holm_adjust(raw_p_values)
+    statistics_df = pd.DataFrame({
+        "plot": plot_stem,
+        "condition_1": comparison_parts[0].map(display_to_export),
+        "condition_2": comparison_parts[1].map(display_to_export),
+        "test": "Mann-Whitney U",
+        "alternative": "two-sided",
+        "p_value_raw": raw_p_values,
+        "significance_raw": pvalue_df["significance"].to_numpy(),
+        "p_value_holm": adjusted_p_values,
+        "significance_holm": [
+            _significance_label(value) for value in adjusted_p_values
+        ],
+    })
+    if statistics_df[["condition_1", "condition_2"]].isna().any().any():
+        raise ValueError(f"Unmapped condition label for {plot_stem}")
+    statistics_df["annotation_displayed"] = (
+        statistics_df["significance_raw"].isin(["*", "**", "***", "****"])
+        if show_stats
+        else False
+    )
+    statistics_df["annotation_basis"] = "raw p-value"
+    return statistics_df
+
+
+def _plot_whisker(
+    condition_arrays,
+    figure,
+    condition_keys,
+    display_labels,
+    export_labels,
+    figures_dir,
+    raw_data_dir,
+    style,
+    source_column=None,
+    max_percentile=99.0,
+    significance_top_padding=0.035,
+):
+    """Create one box-and-whisker plot and its export tables."""
+    plot_stem = figure["figure_name"]
+    points, summary, pvalues = plot_cell_means_box_swarm(
+        condition_arrays,
+        condition_labels=[display_labels[key] for key in condition_keys],
+        output_dir=figures_dir,
+        y_label=figure["y_label"],
+        plot_stem=plot_stem,
+        y_lim=figure["y_limits"],
+        show_stats=style["show_stats"],
+        figsize=style["figsize"],
+        tick_size=style["tick_size"],
+        max_percentile_significance=max_percentile,
+        significance_top_padding=significance_top_padding,
+        save_formats=style["save_formats"],
+        save_dpi=style["save_dpi"],
+    )
+
+    display_to_export = _display_to_export_map(
+        condition_keys,
+        display_labels,
+        export_labels,
+    )
+    source_data = None
+    if source_column is not None:
+        source_path = Path(raw_data_dir) / figure["data_name"]
+        source_data = _export_cell_source(
+            points,
+            source_column,
+            source_path,
+            display_to_export,
+        )
+
+    statistics = _format_pairwise_statistics(
+        pvalues,
+        plot_stem,
+        display_to_export,
+        style["show_stats"],
+    )
+    return {
+        "points": points,
+        "summary": summary,
+        "pvalues": pvalues,
+        "statistics": statistics,
+        "source_data": source_data,
+    }
+
+
+def run_whisker_analyses(
+    tracking_records,
+    condition_keys,
+    display_labels,
+    export_labels,
+    figures,
+    figures_dir,
+    raw_data_dir,
+    channel_index,
+    selected_frame,
+    threshold_um,
+    minimum_snr,
+    style,
+):
+    """Run all count and cell-mean box-and-whisker analyses."""
+    size_field = f"spot_size_ch_{channel_index}"
+    filtered_size_arrays = extract_particle_means_by_cell(
+        tracking_records,
+        condition_keys,
+        size_field,
+        max_particle_mean_size_um=threshold_um,
+        selected_frame=selected_frame,
+        convert_pixels_to_um=True,
+        channel_index=channel_index,
+        min_snr=minimum_snr,
+    )
+    filtered_count_arrays = [
+        [
+            np.array([len(particle_means)], dtype=float)
+            for particle_means in condition_cells
+        ]
+        for condition_cells in filtered_size_arrays
+    ]
+
+    condition_arrays = {
+        "spots_per_cell": extract_spots_per_cell(
+            tracking_records,
+            condition_keys,
+        ),
+        "spots_per_cell_filtered": filtered_count_arrays,
+        "spot_intensity": extract_cell_arrays(
+            tracking_records,
+            condition_keys,
+            f"spot_int_ch_{channel_index}",
+            selected_frame=selected_frame,
+        ),
+        "snr": extract_cell_arrays(
+            tracking_records,
+            condition_keys,
+            f"snr_ch_{channel_index}",
+            selected_frame=selected_frame,
+        ),
+        "spot_size": extract_cell_arrays(
+            tracking_records,
+            condition_keys,
+            size_field,
+            selected_frame=selected_frame,
+            convert_pixels_to_um=True,
+        ),
+        "spot_intensity_filtered": extract_particle_means_by_cell(
+            tracking_records,
+            condition_keys,
+            f"spot_int_ch_{channel_index}",
+            max_particle_mean_size_um=threshold_um,
+            selected_frame=selected_frame,
+            channel_index=channel_index,
+            min_snr=minimum_snr,
+        ),
+        "snr_filtered": extract_particle_means_by_cell(
+            tracking_records,
+            condition_keys,
+            f"snr_ch_{channel_index}",
+            max_particle_mean_size_um=threshold_um,
+            selected_frame=selected_frame,
+            channel_index=channel_index,
+            min_snr=minimum_snr,
+        ),
+        "spot_size_filtered": filtered_size_arrays,
+    }
+
+    source_columns = {
+        "spots_per_cell": "total_unique_tracked_particles",
+        "spots_per_cell_filtered": (
+            "eligible_particles_mean_size_max_threshold"
+        ),
+        "spot_intensity": "mean_spot_intensity_au",
+        "snr": "mean_spot_snr",
+        "spot_size": "mean_spot_size_um",
+        "spot_intensity_filtered": (
+            "mean_particle_spot_intensity_au_max_threshold"
+        ),
+        "snr_filtered": "mean_particle_snr_max_threshold",
+        "spot_size_filtered": "mean_particle_spot_size_um_max_threshold",
+    }
+    high_percentile_keys = {
+        "spots_per_cell",
+        "spots_per_cell_filtered",
+        "spot_size",
+        "spot_size_filtered",
+    }
+    results = {}
+    statistics = {}
+    for key, figure in figures.items():
+        if key not in condition_arrays:
+            raise KeyError(f"Unknown whisker analysis: {key}")
+        plot_figure = dict(figure)
+        plot_figure["y_label"] = figure["y_label"].format(
+            threshold_um=threshold_um
+        )
+        result = _plot_whisker(
+            condition_arrays[key],
+            plot_figure,
+            condition_keys,
+            display_labels,
+            export_labels,
+            figures_dir,
+            raw_data_dir,
+            style,
+            source_column=source_columns[key],
+            max_percentile=(99.9 if key in high_percentile_keys else 99.0),
+        )
+        results[key] = result
+        statistics[key] = result["statistics"]
+    return results, statistics
+
+
+def _export_distribution_source(
+    observations,
+    curves,
+    export_labels,
+    raw_data_dir,
+    observation_filename,
+    curve_filename,
+    observation_column,
+    x_column,
+    density_column,
+):
+    """Export particle observations and KDE coordinates."""
+    observation_source = (
+        observations.assign(
+            condition=observations["condition_key"].map(export_labels)
+        )
+        .rename(columns={"value": observation_column})
+        [["condition", observation_column]]
+    )
+    curve_source = (
+        curves.assign(condition=curves["condition_key"].map(export_labels))
+        .rename(columns={
+            "x_value": x_column,
+            "probability_density": density_column,
+            "n_observations": "n_particle_means",
+        })
+        [["condition", x_column, density_column, "n_particle_means"]]
+    )
+    if (
+        observation_source["condition"].isna().any()
+        or curve_source["condition"].isna().any()
+    ):
+        raise ValueError(
+            f"Unmapped condition while exporting {observation_filename}"
+        )
+
+    raw_data_dir = Path(raw_data_dir)
+    observation_path = raw_data_dir / observation_filename
+    curve_path = raw_data_dir / curve_filename
+    observation_source.to_csv(observation_path, index=False)
+    curve_source.to_csv(curve_path, index=False)
+    print(f"Saved: {observation_path}")
+    print(f"Saved: {curve_path}")
+    return observation_source, curve_source
+
+
+def run_distribution_analyses(
+    tracking_records,
+    condition_keys,
+    display_labels,
+    export_labels,
+    colors,
+    figures,
+    figures_dir,
+    raw_data_dir,
+    channel_index,
+    threshold_um,
+    minimum_snr,
+    style,
+):
+    """Run all configured particle-mean distribution analyses."""
+    specifications = {
+        "intensity_distribution": {
+            "field_prefix": "spot_int_ch_",
+            "observation_column": "mean_particle_spot_intensity_au",
+            "x_column": "spot_intensity_au",
+            "density_column": "probability_density_per_au",
+        },
+        "size_distribution": {
+            "field_prefix": "spot_size_ch_",
+            "observation_column": "mean_particle_spot_size_um",
+            "x_column": "spot_size_um",
+            "density_column": "probability_density_per_um",
+            "convert_pixels_to_um": True,
+        },
+        "intensity_distribution_filtered": {
+            "field_prefix": "spot_int_ch_",
+            "observation_column": (
+                "mean_particle_spot_intensity_au_max_threshold"
+            ),
+            "x_column": "spot_intensity_au",
+            "density_column": "probability_density_per_au",
+            "max_spot_size_um": threshold_um,
+        },
+        "size_distribution_filtered": {
+            "field_prefix": "spot_size_ch_",
+            "observation_column": "mean_particle_spot_size_um_max_threshold",
+            "x_column": "spot_size_um",
+            "density_column": "probability_density_per_um",
+            "convert_pixels_to_um": True,
+            "max_spot_size_um": threshold_um,
+        },
+    }
+
+    results = {}
+    for key, figure in figures.items():
+        if key not in specifications:
+            raise KeyError(f"Unknown distribution analysis: {key}")
+        specification = specifications[key]
+        distributions = extract_particle_distribution(
+            tracking_records,
+            condition_keys,
+            selected_field_prefix=specification["field_prefix"],
+            channel_index=channel_index,
+            min_snr=minimum_snr,
+            convert_pixels_to_um=specification.get(
+                "convert_pixels_to_um", False
+            ),
+            max_spot_size_um=specification.get("max_spot_size_um"),
+        )
+        plot_options = dict(style)
+        setting_names = {
+            "figure_name",
+            "data_name",
+            "kde_data_name",
+            "x_label",
+            "x_limits",
+        }
+        plot_options.update({
+            name: value
+            for name, value in figure.items()
+            if name not in setting_names
+        })
+        observations, curves = plot_distributions(
+            distributions,
+            condition_labels=display_labels,
+            condition_colors=colors,
+            output_dir=figures_dir,
+            x_label=figure["x_label"].format(threshold_um=threshold_um),
+            plot_stem=figure["figure_name"],
+            xlim=figure["x_limits"],
+            **plot_options,
+        )
+        observation_source, curve_source = _export_distribution_source(
+            observations,
+            curves,
+            export_labels,
+            raw_data_dir,
+            figure["data_name"],
+            figure["kde_data_name"],
+            specification["observation_column"],
+            specification["x_column"],
+            specification["density_column"],
+        )
+        results[key] = {
+            "observations": observations,
+            "curves": curves,
+            "observation_source": observation_source,
+            "curve_source": curve_source,
+        }
+    return results
+
+
+def run_large_spot_analysis(
+    tracking_records,
+    condition_keys,
+    display_labels,
+    export_labels,
+    figure,
+    figures_dir,
+    raw_data_dir,
+    channel_index,
+    threshold_um,
+    minimum_snr,
+    style,
+):
+    """Plot and export the per-cell percentage above the size threshold."""
+    spot_summary = summarize_spots_above_threshold(
+        tracking_records,
+        condition_keys,
+        display_labels,
+        threshold_um=threshold_um,
+        channel_index=channel_index,
+        min_snr=minimum_snr,
+    )
+    threshold_token = f"{threshold_um:.2f}".replace(".", "p")
+    source_data = (
+        spot_summary.assign(
+            condition=spot_summary["condition_key"].map(export_labels)
+        )
+        .rename(columns={
+            "spots_above_threshold": f"spots_above_{threshold_token}_um",
+            "percentage_above_threshold": (
+                f"percentage_spots_above_{threshold_token}_um"
+            ),
+        })
+        [[
+            "condition",
+            "threshold_um",
+            f"spots_above_{threshold_token}_um",
+            "total_valid_spots",
+            f"percentage_spots_above_{threshold_token}_um",
+        ]]
+    )
+    source_path = Path(raw_data_dir) / figure["data_name"]
+    source_data.to_csv(source_path, index=False)
+    print(f"Saved: {source_path}")
+
+    condition_summary = (
+        spot_summary.groupby("condition", sort=False)
+        .agg(
+            cells=("cell_file", "count"),
+            spots_above_threshold=("spots_above_threshold", "sum"),
+            total_valid_spots=("total_valid_spots", "sum"),
+            mean_cell_percentage=("percentage_above_threshold", "mean"),
+            median_cell_percentage=("percentage_above_threshold", "median"),
+        )
+        .reset_index()
+    )
+    condition_summary["pooled_percentage_above_threshold"] = np.where(
+        condition_summary["total_valid_spots"] > 0,
+        100
+        * condition_summary["spots_above_threshold"]
+        / condition_summary["total_valid_spots"],
+        np.nan,
+    )
+
+    percentage_arrays = []
+    for key in condition_keys:
+        values = spot_summary.loc[
+            spot_summary["condition_key"] == key,
+            "percentage_above_threshold",
+        ].to_numpy(dtype=float)
+        percentage_arrays.append([
+            np.array([value]) for value in values if np.isfinite(value)
+        ])
+
+    plot_figure = dict(figure)
+    plot_figure["y_label"] = figure["y_label"].format(
+        threshold_um=threshold_um
+    )
+    result = _plot_whisker(
+        percentage_arrays,
+        plot_figure,
+        condition_keys,
+        display_labels,
+        export_labels,
+        figures_dir,
+        raw_data_dir,
+        style,
+        max_percentile=100,
+        significance_top_padding=0.12,
+    )
+    result["spot_summary"] = spot_summary
+    result["condition_summary"] = condition_summary
+    result["source_data"] = source_data
+    return result
+
+
+def save_pairwise_statistics(statistics_by_plot, output_path):
+    """Combine and save the pairwise statistics from all whisker plots."""
+    if not statistics_by_plot:
+        raise ValueError("No pairwise statistics were supplied")
+    statistics = pd.concat(statistics_by_plot.values(), ignore_index=True)
+    output_path = Path(output_path)
+    statistics.to_csv(output_path, index=False)
+    print(f"Saved: {output_path}")
+    return statistics
