@@ -13,6 +13,7 @@ from scipy.stats import gaussian_kde, mannwhitneyu
 
 __all__ = [
     "build_audit_dataframe",
+    "build_size_filter_audit",
     "extract_cell_arrays",
     "extract_particle_means_by_cell",
     "extract_particle_distribution",
@@ -26,6 +27,9 @@ __all__ = [
     "run_whisker_analyses",
     "save_pairwise_statistics",
 ]
+
+
+_SIZE_FILTER_MODES = frozenset({"trajectory_mean", "detection"})
 
 
 def _real_tracking_files(dataset_root: Path):
@@ -86,6 +90,113 @@ def _metadata_pixel_size_um(tracking_file: Path):
 def _particle_column(dataframe):
     """Return the available tracked-particle identifier column."""
     return "unique_particle" if "unique_particle" in dataframe.columns else "particle"
+
+
+def _validate_size_filter_mode(size_filter_mode):
+    """Return a validated size-filter mode."""
+    if size_filter_mode not in _SIZE_FILTER_MODES:
+        allowed = ", ".join(sorted(_SIZE_FILTER_MODES))
+        raise ValueError(
+            f"size_filter_mode must be one of {allowed}; "
+            f"received {size_filter_mode!r}"
+        )
+    return size_filter_mode
+
+
+def _prepare_size_filter_table(
+    dataframe,
+    *,
+    size_column,
+    pixel_size_um,
+    threshold_um,
+    size_filter_mode,
+    snr_column=None,
+    min_snr=None,
+    selected_frame=None,
+):
+    """Annotate valid detections and apply the selected size-filter unit."""
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
+    if threshold_um is not None and (
+        not np.isfinite(threshold_um) or threshold_um <= 0
+    ):
+        raise ValueError("threshold_um must be positive and finite")
+    if not np.isfinite(pixel_size_um) or pixel_size_um <= 0:
+        raise ValueError("pixel_size_um must be positive and finite")
+
+    prepared = dataframe.copy()
+    if selected_frame is not None and "frame" in prepared.columns:
+        prepared = prepared.loc[prepared["frame"] == selected_frame].copy()
+
+    particle_column = _particle_column(prepared)
+    if particle_column not in prepared.columns:
+        raise KeyError("Tracked-particle identifier is missing")
+
+    valid_mask = prepared[particle_column].notna().to_numpy()
+    if snr_column is not None and snr_column in prepared.columns:
+        snr_values = pd.to_numeric(
+            prepared[snr_column], errors="coerce"
+        ).to_numpy(dtype=float)
+        valid_mask &= np.isfinite(snr_values)
+        if min_snr is not None:
+            valid_mask &= snr_values >= min_snr
+
+    if threshold_um is None:
+        prepared = prepared.loc[valid_mask].copy()
+        prepared["_spot_size_um"] = np.nan
+        prepared["_trajectory_mean_spot_size_um"] = np.nan
+        prepared["_detection_above_size_threshold"] = False
+        prepared["_trajectory_above_size_threshold"] = False
+        prepared["_retained_by_size_filter"] = True
+        return prepared
+
+    if size_column not in prepared.columns:
+        raise KeyError(f"{size_column} is missing")
+    size_pixels = pd.to_numeric(
+        prepared[size_column], errors="coerce"
+    ).to_numpy(dtype=float)
+    size_um = size_pixels * float(pixel_size_um)
+    valid_mask &= np.isfinite(size_um) & (size_um > 0)
+    prepared = prepared.loc[valid_mask].copy()
+    prepared["_spot_size_um"] = size_um[valid_mask]
+
+    if prepared.empty:
+        prepared["_trajectory_mean_spot_size_um"] = pd.Series(dtype=float)
+        prepared["_detection_above_size_threshold"] = pd.Series(dtype=bool)
+        prepared["_trajectory_above_size_threshold"] = pd.Series(dtype=bool)
+        prepared["_retained_by_size_filter"] = pd.Series(dtype=bool)
+        return prepared
+
+    prepared["_trajectory_mean_spot_size_um"] = prepared.groupby(
+        particle_column, sort=False
+    )["_spot_size_um"].transform("mean")
+    prepared["_detection_above_size_threshold"] = (
+        prepared["_spot_size_um"] > threshold_um
+    )
+    prepared["_trajectory_above_size_threshold"] = (
+        prepared["_trajectory_mean_spot_size_um"] > threshold_um
+    )
+    if size_filter_mode == "trajectory_mean":
+        retained = ~prepared["_trajectory_above_size_threshold"]
+    else:
+        retained = ~prepared["_detection_above_size_threshold"]
+    prepared["_retained_by_size_filter"] = retained
+    return prepared
+
+
+def _size_filter_label(size_filter_mode, threshold_um):
+    """Return a concise label describing the active size filter."""
+    _validate_size_filter_mode(size_filter_mode)
+    if size_filter_mode == "trajectory_mean":
+        return rf"trajectory mean $\leq {threshold_um:g}\ \mu$m"
+    return rf"detections $\leq {threshold_um:g}\ \mu$m"
+
+
+def _size_filter_count_label(size_filter_mode, threshold_um):
+    """Return the retention rule used by a filtered trajectory count."""
+    _validate_size_filter_mode(size_filter_mode)
+    if size_filter_mode == "trajectory_mean":
+        return rf"mean size $\leq {threshold_um:g}\ \mu$m"
+    return rf"$\geq 1$ detection $\leq {threshold_um:g}\ \mu$m"
 
 
 def load_tracking_records(
@@ -199,13 +310,16 @@ def extract_particle_means_by_cell(
     convert_pixels_to_um=False,
     channel_index=0,
     min_snr=None,
+    size_filter_mode="trajectory_mean",
 ):
     """Return equally weighted particle means per cell after a size filter.
 
-    Particle eligibility is determined from its mean spot size across valid
-    frames. The returned arrays contain one mean selected-field value per
-    eligible particle, so a later cell mean gives every particle equal weight.
+    In ``trajectory_mean`` mode, an entire particle is retained when its mean
+    size is at most the threshold. In ``detection`` mode, individual detections
+    above the threshold are removed first. The returned arrays contain one mean
+    selected-field value per remaining particle, preserving equal weighting.
     """
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
     condition_arrays = []
     size_field = f"spot_size_ch_{channel_index}"
     snr_field = f"snr_ch_{channel_index}"
@@ -222,50 +336,115 @@ def extract_particle_means_by_cell(
                     f"{missing_text} missing from {record['tracking_file']}"
                 )
 
-            sub_df = dataframe
-            if selected_frame is not None and "frame" in sub_df.columns:
-                sub_df = sub_df.loc[sub_df["frame"] == selected_frame]
-
-            particle_column = _particle_column(sub_df)
-            if particle_column not in sub_df.columns:
-                raise KeyError(
-                    f"Tracked-particle identifier missing from "
-                    f"{record['tracking_file']}"
+            try:
+                prepared = _prepare_size_filter_table(
+                    dataframe,
+                    size_column=size_field,
+                    pixel_size_um=record["pixel_size_um"],
+                    threshold_um=max_particle_mean_size_um,
+                    size_filter_mode=size_filter_mode,
+                    snr_column=snr_field,
+                    min_snr=min_snr,
+                    selected_frame=selected_frame,
                 )
+            except KeyError as exc:
+                raise KeyError(
+                    f"{exc.args[0]} in {record['tracking_file']}"
+                ) from exc
 
-            spot_size_um = (
-                sub_df[size_field].to_numpy(dtype=float)
-                * record["pixel_size_um"]
-            )
-            selected_values = sub_df[selected_field].to_numpy(dtype=float)
+            retained = prepared.loc[
+                prepared["_retained_by_size_filter"]
+            ].copy()
+            particle_column = _particle_column(retained)
+            selected_values = pd.to_numeric(
+                retained[selected_field], errors="coerce"
+            ).to_numpy(dtype=float)
             if convert_pixels_to_um:
                 selected_values = selected_values * record["pixel_size_um"]
 
-            valid_mask = np.isfinite(spot_size_um) & (spot_size_um > 0)
-            if min_snr is not None and snr_field in sub_df.columns:
-                snr_values = sub_df[snr_field].to_numpy(dtype=float)
-                valid_mask &= np.isfinite(snr_values) & (snr_values >= min_snr)
-
+            valid_selected = np.isfinite(selected_values)
             particle_frame_values = pd.DataFrame({
-                "particle": sub_df[particle_column].to_numpy()[valid_mask],
-                "spot_size_um": spot_size_um[valid_mask],
-                "selected_value": selected_values[valid_mask],
+                "particle": retained[particle_column].to_numpy()[valid_selected],
+                "selected_value": selected_values[valid_selected],
             })
-            particle_summary = (
-                particle_frame_values.groupby("particle", sort=False)
-                .agg(
-                    mean_spot_size_um=("spot_size_um", "mean"),
-                    mean_selected_value=("selected_value", "mean"),
-                )
+            eligible_values = (
+                particle_frame_values.groupby("particle", sort=False)[
+                    "selected_value"
+                ]
+                .mean()
+                .to_numpy(dtype=float)
             )
-            eligible_values = particle_summary.loc[
-                particle_summary["mean_spot_size_um"]
-                <= max_particle_mean_size_um,
-                "mean_selected_value",
-            ].to_numpy(dtype=float)
             cell_arrays.append(eligible_values[np.isfinite(eligible_values)])
         condition_arrays.append(cell_arrays)
     return condition_arrays
+
+
+def build_size_filter_audit(
+    tracking_records,
+    condition_keys,
+    condition_labels,
+    threshold_um,
+    channel_index=0,
+    min_snr=0.0,
+    selected_frame=None,
+    size_filter_mode="trajectory_mean",
+):
+    """Summarize detection and trajectory retention for every cell."""
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
+    size_column = f"spot_size_ch_{channel_index}"
+    snr_column = f"snr_ch_{channel_index}"
+    rows = []
+
+    for key in condition_keys:
+        for record in tracking_records[key]:
+            try:
+                prepared = _prepare_size_filter_table(
+                    record["dataframe"],
+                    size_column=size_column,
+                    pixel_size_um=record["pixel_size_um"],
+                    threshold_um=threshold_um,
+                    size_filter_mode=size_filter_mode,
+                    snr_column=snr_column,
+                    min_snr=min_snr,
+                    selected_frame=selected_frame,
+                )
+            except KeyError as exc:
+                raise KeyError(
+                    f"{exc.args[0]} in {record['tracking_file']}"
+                ) from exc
+
+            particle_column = _particle_column(prepared)
+            retained = prepared.loc[
+                prepared["_retained_by_size_filter"]
+            ]
+            particles_before = int(prepared[particle_column].nunique())
+            particles_retained = int(retained[particle_column].nunique())
+            trajectory_flags = prepared.drop_duplicates(particle_column)
+            rows.append({
+                "condition_key": key,
+                "condition": condition_labels[key],
+                "cell_file": record["cell_name"],
+                "tracking_csv": str(record["tracking_file"]),
+                "pixel_size_um": record["pixel_size_um"],
+                "threshold_um": threshold_um,
+                "size_filter_mode": size_filter_mode,
+                "valid_detections_before_filter": int(len(prepared)),
+                "detections_above_threshold": int(
+                    prepared["_detection_above_size_threshold"].sum()
+                ),
+                "detections_retained": int(len(retained)),
+                "trajectories_before_filter": particles_before,
+                "trajectories_with_mean_above_threshold": int(
+                    trajectory_flags[
+                        "_trajectory_above_size_threshold"
+                    ].sum()
+                ),
+                "trajectories_retained": particles_retained,
+                "trajectories_losing_all_detections": (
+                    particles_before - particles_retained
+                ),
+            })
+    return pd.DataFrame(rows)
 
 
 
@@ -494,8 +673,10 @@ def extract_particle_distribution(
     timepoint_frame=None,
     convert_pixels_to_um=False,
     max_spot_size_um=None,
+    size_filter_mode="trajectory_mean",
 ):
     """Extract existing CSV values in three modes without pixel recalculation."""
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
     value_column = f"{selected_field_prefix}{channel_index}"
     snr_column = f"snr_ch_{channel_index}"
     size_column = f"spot_size_ch_{channel_index}"
@@ -512,60 +693,43 @@ def extract_particle_distribution(
             dataframe = record["dataframe"].copy()
             if value_column not in dataframe.columns:
                 raise KeyError(f"{value_column} missing from {record['tracking_file']}")
-            if max_spot_size_um is not None and size_column not in dataframe.columns:
-                raise KeyError(f"{size_column} missing from {record['tracking_file']}")
-            if snr_column in dataframe.columns:
-                dataframe = dataframe.loc[dataframe[snr_column] >= min_snr].copy()
-            dataframe = dataframe.loc[
-                dataframe[value_column].notna() & (dataframe[value_column] > 0)
+            try:
+                prepared = _prepare_size_filter_table(
+                    dataframe,
+                    size_column=size_column,
+                    pixel_size_um=record["pixel_size_um"],
+                    threshold_um=max_spot_size_um,
+                    size_filter_mode=size_filter_mode,
+                    snr_column=snr_column,
+                    min_snr=min_snr,
+                )
+            except KeyError as exc:
+                raise KeyError(
+                    f"{exc.args[0]} in {record['tracking_file']}"
+                ) from exc
+
+            prepared = prepared.loc[
+                prepared["_retained_by_size_filter"]
             ].copy()
-            if dataframe.empty:
+            selected_values = pd.to_numeric(
+                prepared[value_column], errors="coerce"
+            ).to_numpy(dtype=float)
+            valid_selected = np.isfinite(selected_values) & (selected_values > 0)
+            prepared = prepared.loc[valid_selected].copy()
+            selected_values = selected_values[valid_selected]
+            if convert_pixels_to_um:
+                selected_values = selected_values * record["pixel_size_um"]
+            prepared[value_column] = selected_values
+            if prepared.empty:
                 continue
 
-            size_um = (
-                dataframe[size_column].astype(float) * record["pixel_size_um"]
-                if max_spot_size_um is not None
-                else None
-            )
-            if convert_pixels_to_um:
-                dataframe[value_column] = (
-                    dataframe[value_column].astype(float) * record["pixel_size_um"]
-                )
-
-            particle_column = _particle_column(dataframe)
-            if max_spot_size_um is not None:
-                if particle_column in dataframe.columns:
-                    particle_size_um = size_um.groupby(
-                        dataframe[particle_column]
-                    ).mean()
-                    valid_particles = set(
-                        particle_size_um[particle_size_um <= max_spot_size_um].index
-                    )
-                    means = dataframe.groupby(particle_column)[value_column].mean()
-                    means = means[means.index.isin(valid_particles)]
-                    mean_per_particle.extend(means.to_list())
-                else:
-                    if size_um.mean() <= max_spot_size_um:
-                        mean_per_particle.append(dataframe[value_column].mean())
-
-                valid_obs = dataframe.loc[size_um <= max_spot_size_um, value_column]
-                all_timepoints.extend(valid_obs.to_list())
-                if "frame" in dataframe.columns:
-                    valid_frames.extend(
-                        dataframe.loc[size_um <= max_spot_size_um, "frame"].to_list()
-                    )
-                prepared_records.append(dataframe.loc[size_um <= max_spot_size_um])
-            else:
-                if particle_column in dataframe.columns:
-                    means = dataframe.groupby(particle_column)[value_column].mean()
-                    mean_per_particle.extend(means.to_list())
-                else:
-                    mean_per_particle.append(dataframe[value_column].mean())
-
-                all_timepoints.extend(dataframe[value_column].to_list())
-                if "frame" in dataframe.columns:
-                    valid_frames.extend(dataframe["frame"].to_list())
-                prepared_records.append(dataframe)
+            particle_column = _particle_column(prepared)
+            means = prepared.groupby(particle_column)[value_column].mean()
+            mean_per_particle.extend(means.to_list())
+            all_timepoints.extend(prepared[value_column].to_list())
+            if "frame" in prepared.columns:
+                valid_frames.extend(prepared["frame"].to_list())
+            prepared_records.append(prepared)
 
         selected_timepoint = (
             int(np.median(valid_frames))
@@ -841,26 +1005,47 @@ def summarize_spots_above_threshold(
     threshold_um,
     channel_index=0,
     min_snr=0.0,
+    size_filter_mode="trajectory_mean",
 ):
-    """Summarize the per-cell fraction of particle means above a threshold."""
+    """Summarize per-cell trajectories or detections above a threshold."""
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
     size_column = f"spot_size_ch_{channel_index}"
     snr_column = f"snr_ch_{channel_index}"
+    summary_unit = (
+        "trajectory" if size_filter_mode == "trajectory_mean" else "detection"
+    )
     rows = []
 
     for key in condition_keys:
         for record in tracking_records[key]:
-            dataframe = record["dataframe"].copy()
-            if snr_column in dataframe.columns:
-                dataframe = dataframe.loc[dataframe[snr_column] >= min_snr].copy()
-            dataframe = dataframe.loc[
-                dataframe[size_column].notna() & (dataframe[size_column] > 0)
-            ].copy()
+            try:
+                prepared = _prepare_size_filter_table(
+                    record["dataframe"],
+                    size_column=size_column,
+                    pixel_size_um=record["pixel_size_um"],
+                    threshold_um=threshold_um,
+                    size_filter_mode=size_filter_mode,
+                    snr_column=snr_column,
+                    min_snr=min_snr,
+                )
+            except KeyError as exc:
+                raise KeyError(
+                    f"{exc.args[0]} in {record['tracking_file']}"
+                ) from exc
 
-            particle_column = _particle_column(dataframe)
-            particle_mean_pixels = dataframe.groupby(particle_column)[size_column].mean()
-            particle_mean_um = particle_mean_pixels * record["pixel_size_um"]
-            count_above = int((particle_mean_um > threshold_um).sum())
-            total_particles = int(len(particle_mean_um))
+            if size_filter_mode == "trajectory_mean":
+                particle_column = _particle_column(prepared)
+                units = prepared.drop_duplicates(particle_column)
+                above_threshold = units[
+                    "_trajectory_above_size_threshold"
+                ]
+            else:
+                units = prepared
+                above_threshold = units[
+                    "_detection_above_size_threshold"
+                ]
+            count_above = int(above_threshold.sum())
+            total_units = int(len(units))
             rows.append({
                 "condition_key": key,
                 "condition": condition_labels[key],
@@ -868,10 +1053,12 @@ def summarize_spots_above_threshold(
                 "tracking_csv": str(record["tracking_file"]),
                 "pixel_size_um": record["pixel_size_um"],
                 "threshold_um": threshold_um,
-                "spots_above_threshold": count_above,
-                "total_valid_spots": total_particles,
+                "size_filter_mode": size_filter_mode,
+                "summary_unit": summary_unit,
+                "units_above_threshold": count_above,
+                "total_valid_units": total_units,
                 "percentage_above_threshold": (
-                    100 * count_above / total_particles if total_particles else np.nan
+                    100 * count_above / total_units if total_units else np.nan
                 ),
             })
     return pd.DataFrame(rows)
@@ -1054,8 +1241,10 @@ def run_whisker_analyses(
     threshold_um,
     minimum_snr,
     style,
+    size_filter_mode="trajectory_mean",
 ):
     """Run all count and cell-mean box-and-whisker analyses."""
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
     size_field = f"spot_size_ch_{channel_index}"
     filtered_size_arrays = extract_particle_means_by_cell(
         tracking_records,
@@ -1066,6 +1255,7 @@ def run_whisker_analyses(
         convert_pixels_to_um=True,
         channel_index=channel_index,
         min_snr=minimum_snr,
+        size_filter_mode=size_filter_mode,
     )
     filtered_count_arrays = [
         [
@@ -1108,6 +1298,7 @@ def run_whisker_analyses(
             selected_frame=selected_frame,
             channel_index=channel_index,
             min_snr=minimum_snr,
+            size_filter_mode=size_filter_mode,
         ),
         "snr_filtered": extract_particle_means_by_cell(
             tracking_records,
@@ -1117,23 +1308,31 @@ def run_whisker_analyses(
             selected_frame=selected_frame,
             channel_index=channel_index,
             min_snr=minimum_snr,
+            size_filter_mode=size_filter_mode,
         ),
         "spot_size_filtered": filtered_size_arrays,
     }
 
+    filter_source_token = (
+        "trajectory_mean_size_filter"
+        if size_filter_mode == "trajectory_mean"
+        else "detection_size_filter"
+    )
     source_columns = {
         "spots_per_cell": "total_unique_tracked_particles",
         "spots_per_cell_filtered": (
-            "eligible_particles_mean_size_max_threshold"
+            f"eligible_particles_after_{filter_source_token}"
         ),
         "spot_intensity": "mean_spot_intensity_au",
         "snr": "mean_spot_snr",
         "spot_size": "mean_spot_size_um",
         "spot_intensity_filtered": (
-            "mean_particle_spot_intensity_au_max_threshold"
+            f"mean_particle_spot_intensity_au_after_{filter_source_token}"
         ),
-        "snr_filtered": "mean_particle_snr_max_threshold",
-        "spot_size_filtered": "mean_particle_spot_size_um_max_threshold",
+        "snr_filtered": f"mean_particle_snr_after_{filter_source_token}",
+        "spot_size_filtered": (
+            f"mean_particle_spot_size_um_after_{filter_source_token}"
+        ),
     }
     high_percentile_keys = {
         "spots_per_cell",
@@ -1148,7 +1347,13 @@ def run_whisker_analyses(
             raise KeyError(f"Unknown whisker analysis: {key}")
         plot_figure = dict(figure)
         plot_figure["y_label"] = figure["y_label"].format(
-            threshold_um=threshold_um
+            threshold_um=threshold_um,
+            filter_label=_size_filter_label(
+                size_filter_mode, threshold_um
+            ),
+            filter_count_label=_size_filter_count_label(
+                size_filter_mode, threshold_um
+            ),
         )
         result = _plot_whisker(
             condition_arrays[key],
@@ -1226,8 +1431,15 @@ def run_distribution_analyses(
     threshold_um,
     minimum_snr,
     style,
+    size_filter_mode="trajectory_mean",
 ):
     """Run all configured particle-mean distribution analyses."""
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
+    filter_source_token = (
+        "trajectory_mean_size_filter"
+        if size_filter_mode == "trajectory_mean"
+        else "detection_size_filter"
+    )
     specifications = {
         "intensity_distribution": {
             "field_prefix": "spot_int_ch_",
@@ -1245,7 +1457,8 @@ def run_distribution_analyses(
         "intensity_distribution_filtered": {
             "field_prefix": "spot_int_ch_",
             "observation_column": (
-                "mean_particle_spot_intensity_au_max_threshold"
+                "mean_particle_spot_intensity_au_after_"
+                f"{filter_source_token}"
             ),
             "x_column": "spot_intensity_au",
             "density_column": "probability_density_per_au",
@@ -1253,7 +1466,9 @@ def run_distribution_analyses(
         },
         "size_distribution_filtered": {
             "field_prefix": "spot_size_ch_",
-            "observation_column": "mean_particle_spot_size_um_max_threshold",
+            "observation_column": (
+                f"mean_particle_spot_size_um_after_{filter_source_token}"
+            ),
             "x_column": "spot_size_um",
             "density_column": "probability_density_per_um",
             "convert_pixels_to_um": True,
@@ -1276,6 +1491,7 @@ def run_distribution_analyses(
                 "convert_pixels_to_um", False
             ),
             max_spot_size_um=specification.get("max_spot_size_um"),
+            size_filter_mode=size_filter_mode,
         )
         plot_options = dict(style)
         setting_names = {
@@ -1295,7 +1511,12 @@ def run_distribution_analyses(
             condition_labels=display_labels,
             condition_colors=colors,
             output_dir=figures_dir,
-            x_label=figure["x_label"].format(threshold_um=threshold_um),
+            x_label=figure["x_label"].format(
+                threshold_um=threshold_um,
+                filter_label=_size_filter_label(
+                    size_filter_mode, threshold_um
+                ),
+            ),
             plot_stem=figure["figure_name"],
             xlim=figure["x_limits"],
             **plot_options,
@@ -1332,8 +1553,14 @@ def run_large_spot_analysis(
     threshold_um,
     minimum_snr,
     style,
+    size_filter_mode="trajectory_mean",
 ):
     """Plot and export the per-cell percentage above the size threshold."""
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
+    summary_unit = (
+        "trajectory" if size_filter_mode == "trajectory_mean" else "detection"
+    )
+    unit_plural = f"{summary_unit}s"
     spot_summary = summarize_spots_above_threshold(
         tracking_records,
         condition_keys,
@@ -1341,24 +1568,29 @@ def run_large_spot_analysis(
         threshold_um=threshold_um,
         channel_index=channel_index,
         min_snr=minimum_snr,
+        size_filter_mode=size_filter_mode,
     )
     threshold_token = f"{threshold_um:.2f}".replace(".", "p")
+    count_column = f"{unit_plural}_above_{threshold_token}_um"
+    total_column = f"total_valid_{unit_plural}"
+    percentage_column = f"percentage_{unit_plural}_above_{threshold_token}_um"
     source_data = (
         spot_summary.assign(
             condition=spot_summary["condition_key"].map(export_labels)
         )
         .rename(columns={
-            "spots_above_threshold": f"spots_above_{threshold_token}_um",
-            "percentage_above_threshold": (
-                f"percentage_spots_above_{threshold_token}_um"
-            ),
+            "units_above_threshold": count_column,
+            "total_valid_units": total_column,
+            "percentage_above_threshold": percentage_column,
         })
         [[
             "condition",
             "threshold_um",
-            f"spots_above_{threshold_token}_um",
-            "total_valid_spots",
-            f"percentage_spots_above_{threshold_token}_um",
+            "size_filter_mode",
+            "summary_unit",
+            count_column,
+            total_column,
+            percentage_column,
         ]]
     )
     source_path = Path(raw_data_dir) / figure["data_name"]
@@ -1369,20 +1601,22 @@ def run_large_spot_analysis(
         spot_summary.groupby("condition", sort=False)
         .agg(
             cells=("cell_file", "count"),
-            spots_above_threshold=("spots_above_threshold", "sum"),
-            total_valid_spots=("total_valid_spots", "sum"),
+            units_above_threshold=("units_above_threshold", "sum"),
+            total_valid_units=("total_valid_units", "sum"),
             mean_cell_percentage=("percentage_above_threshold", "mean"),
             median_cell_percentage=("percentage_above_threshold", "median"),
         )
         .reset_index()
     )
     condition_summary["pooled_percentage_above_threshold"] = np.where(
-        condition_summary["total_valid_spots"] > 0,
+        condition_summary["total_valid_units"] > 0,
         100
-        * condition_summary["spots_above_threshold"]
-        / condition_summary["total_valid_spots"],
+        * condition_summary["units_above_threshold"]
+        / condition_summary["total_valid_units"],
         np.nan,
     )
+    condition_summary.insert(1, "size_filter_mode", size_filter_mode)
+    condition_summary.insert(2, "summary_unit", summary_unit)
 
     percentage_arrays = []
     for key in condition_keys:
@@ -1396,7 +1630,8 @@ def run_large_spot_analysis(
 
     plot_figure = dict(figure)
     plot_figure["y_label"] = figure["y_label"].format(
-        threshold_um=threshold_um
+        threshold_um=threshold_um,
+        filter_unit_plural=unit_plural.title(),
     )
     result = _plot_whisker(
         percentage_arrays,

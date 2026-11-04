@@ -37,15 +37,17 @@ _BASE_TABLE_FILENAMES = {
 }
 
 _CHANNEL_COLORS = (
-    "#00C033",  # green (channel 0)
-    "#FF00FF",  # magenta (channel 1)
+    "#509441",  # green (channel 0)
+    "#ED54F8",  # magenta (channel 1)
     "#009E73",  # bluish green
     "#CC79A7",  # reddish purple
 )
 _CHANNEL_MARKERS = ("o", "s", "^", "D")
+_SIZE_FILTER_MODES = frozenset({"trajectory_mean", "detection"})
 
 _FINAL_TABLE_FILENAMES = {
     "trajectory_spot_summary": "trajectory_spot_summary.csv",
+    "trajectory_size_filter_summary": "trajectory_size_filter_summary.csv",
     "cell_spot_summary": "cell_spot_summary.csv",
     "cell_analysis_summary": "cell_analysis_summary.csv",
     "channel_condition_summary": "channel_condition_summary.csv",
@@ -114,6 +116,22 @@ METRIC_SPECS = {
         "label": "No. trajectories per cell",
         "title": "Tracking yield",
         "unit": "trajectories",
+        "trajectory_metric": None,
+        "default_log": False,
+        "zero_baseline": True,
+    },
+    "n_trajectories_above_size_threshold": {
+        "label": "No. trajectories above the size threshold per cell",
+        "title": "Large trajectories",
+        "unit": "trajectories",
+        "trajectory_metric": None,
+        "default_log": False,
+        "zero_baseline": True,
+    },
+    "n_size_units_above_threshold": {
+        "label": "No. observations above the size threshold per cell",
+        "title": "Large observations",
+        "unit": "count",
         "trajectory_metric": None,
         "default_log": False,
         "zero_baseline": True,
@@ -511,16 +529,74 @@ def _trajectory_summary_for_unit(unit: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _validate_size_filter_mode(size_filter_mode: str) -> str:
+    """Return a validated spot-size filtering unit."""
+    if size_filter_mode not in _SIZE_FILTER_MODES:
+        allowed = ", ".join(sorted(_SIZE_FILTER_MODES))
+        raise ValueError(
+            f"size_filter_mode must be one of {allowed}; "
+            f"received {size_filter_mode!r}."
+        )
+    return size_filter_mode
+
+
+def _mapped_spot_size_um(
+    tracking: pd.DataFrame,
+    measurement_channel_map: Mapping[int, int],
+) -> pd.Series:
+    """Return matched-channel spot FWHM in micrometers for every row."""
+    values = pd.Series(np.nan, index=tracking.index, dtype=float)
+    groups = tracking.groupby("channel", sort=False).groups
+    for channel, indices in groups.items():
+        measurement_channel = measurement_channel_map.get(
+            int(channel), int(channel)
+        )
+        size_column = f"spot_size_ch_{measurement_channel}"
+        if size_column not in tracking.columns:
+            raise ValueError(
+                f"Trajectory channel {int(channel)} is missing its mapped "
+                f"spot-size column {size_column!r}."
+            )
+        subset = tracking.loc[indices]
+        size_pixels = pd.to_numeric(
+            subset[size_column], errors="coerce"
+        ).to_numpy(dtype=float)
+        calibration = pd.to_numeric(
+            subset["xy_um_per_px"], errors="coerce"
+        ).to_numpy(dtype=float)
+        size_um = size_pixels * calibration
+        valid = (
+            np.isfinite(size_um)
+            & np.isfinite(size_pixels)
+            & (size_pixels > 0)
+            & np.isfinite(calibration)
+            & (calibration > 0)
+        )
+        values.loc[indices] = np.where(valid, size_um, np.nan)
+    return values
+
+
 def _trajectory_filter_summary(
     tracking: pd.DataFrame,
     *,
     minimum_trajectory_frames: int,
     reject_trajectory_gaps: bool,
+    maximum_trajectory_spot_fwhm_um: float | None = None,
+    measurement_channel_map: Mapping[int, int] | None = None,
+    size_filter_mode: str = "trajectory_mean",
 ) -> pd.DataFrame:
     """Describe and classify every trajectory before MSD calculations."""
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
+    measurement_channel_map = {
+        int(key): int(value)
+        for key, value in (measurement_channel_map or {}).items()
+    }
+    row_spot_size_um = _mapped_spot_size_um(tracking, measurement_channel_map)
     rows: list[dict[str, Any]] = []
     for particle_id, trajectory in tracking.groupby("global_particle_id", sort=True):
         metadata = trajectory.iloc[0]
+        channel = int(metadata["channel"])
+        measurement_channel = measurement_channel_map.get(channel, channel)
         frames = np.sort(trajectory["frame"].dropna().astype(int).unique())
         first_frame = int(frames[0])
         last_frame = int(frames[-1])
@@ -530,30 +606,177 @@ def _trajectory_filter_summary(
         has_frame_gaps = bool(
             len(frames) > 1 and np.any(np.diff(frames) != 1)
         )
-        too_short = n_unique_frames < int(minimum_trajectory_frames)
-        rejected_for_gaps = bool(reject_trajectory_gaps and has_frame_gaps)
+        too_short_before_size = n_unique_frames < int(minimum_trajectory_frames)
+        gaps_before_size = bool(reject_trajectory_gaps and has_frame_gaps)
+        passes_length_gap_filter_before_size = not (
+            too_short_before_size or gaps_before_size
+        )
+
+        mean_spot_fwhm_um = np.nan
+        above_size_threshold = False
+        passes_spot_size_filter = True
+        size_um = row_spot_size_um.loc[trajectory.index].to_numpy(dtype=float)
+        valid_size = np.isfinite(size_um)
+        n_valid_size_detections = int(valid_size.sum())
+        n_detections_above_threshold = 0
+        retained_detection_mask = np.ones(len(trajectory), dtype=bool)
+
+        if n_valid_size_detections:
+            mean_spot_fwhm_um = float(np.mean(size_um[valid_size]))
+        if maximum_trajectory_spot_fwhm_um is not None:
+            above_size_threshold = bool(
+                mean_spot_fwhm_um > maximum_trajectory_spot_fwhm_um
+            )
+            detection_above = (
+                valid_size
+                & (size_um > maximum_trajectory_spot_fwhm_um)
+            )
+            n_detections_above_threshold = int(detection_above.sum())
+            if size_filter_mode == "trajectory_mean":
+                passes_spot_size_filter = not above_size_threshold
+                retained_detection_mask = np.full(
+                    len(trajectory), passes_spot_size_filter, dtype=bool
+                )
+            else:
+                retained_detection_mask = (
+                    valid_size
+                    & (size_um <= maximum_trajectory_spot_fwhm_um)
+                )
+                passes_spot_size_filter = bool(
+                    retained_detection_mask.any()
+                )
+        else:
+            passes_spot_size_filter = True
+            retained_detection_mask = np.ones(len(trajectory), dtype=bool)
+
+        size_filtered_trajectory = trajectory.loc[retained_detection_mask]
+        filtered_frames = np.sort(
+            size_filtered_trajectory["frame"].dropna().astype(int).unique()
+        )
+        n_unique_frames_after_size = int(len(filtered_frames))
+        if n_unique_frames_after_size:
+            first_frame_after_size = int(filtered_frames[0])
+            last_frame_after_size = int(filtered_frames[-1])
+            span_frames_after_size = (
+                last_frame_after_size - first_frame_after_size + 1
+            )
+            n_missing_frames_after_size = int(
+                span_frames_after_size - n_unique_frames_after_size
+            )
+            has_frame_gaps_after_size = bool(
+                len(filtered_frames) > 1
+                and np.any(np.diff(filtered_frames) != 1)
+            )
+        else:
+            first_frame_after_size = np.nan
+            last_frame_after_size = np.nan
+            span_frames_after_size = 0
+            n_missing_frames_after_size = 0
+            has_frame_gaps_after_size = False
+
+        if (
+            maximum_trajectory_spot_fwhm_um is not None
+            and size_filter_mode == "detection"
+        ):
+            too_short = (
+                n_unique_frames_after_size < int(minimum_trajectory_frames)
+            )
+            rejected_for_gaps = bool(
+                reject_trajectory_gaps and has_frame_gaps_after_size
+            )
+        else:
+            too_short = too_short_before_size
+            rejected_for_gaps = gaps_before_size
+        passes_length_gap_filter = not (too_short or rejected_for_gaps)
+
         reasons = []
-        if too_short:
+        if too_short_before_size:
             reasons.append(f"fewer_than_{int(minimum_trajectory_frames)}_frames")
-        if rejected_for_gaps:
+        if gaps_before_size:
             reasons.append("frame_gaps")
+        if maximum_trajectory_spot_fwhm_um is not None:
+            if not np.isfinite(mean_spot_fwhm_um):
+                reasons.append("missing_trajectory_mean_spot_fwhm")
+            elif size_filter_mode == "trajectory_mean" and above_size_threshold:
+                reasons.append(
+                    "trajectory_mean_spot_fwhm_above_"
+                    f"{maximum_trajectory_spot_fwhm_um:g}_um"
+                )
+            elif size_filter_mode == "detection" and not passes_spot_size_filter:
+                reasons.append(
+                    "all_detections_above_"
+                    f"{maximum_trajectory_spot_fwhm_um:g}_um"
+                )
+            if (
+                size_filter_mode == "detection"
+                and passes_length_gap_filter_before_size
+                and passes_spot_size_filter
+            ):
+                if too_short:
+                    reasons.append(
+                        "fewer_than_"
+                        f"{int(minimum_trajectory_frames)}_frames_after_"
+                        "detection_size_filter"
+                    )
+                if rejected_for_gaps:
+                    reasons.append("frame_gaps_after_detection_size_filter")
         rows.append(
             {
                 "condition": metadata["condition"],
                 "source_id": metadata["source_id"],
                 "local_cell_id": metadata["local_cell_id"],
                 "global_cell_id": metadata["global_cell_id"],
-                "channel": int(metadata["channel"]),
+                "channel": channel,
+                "measurement_channel": measurement_channel,
                 "original_particle_id": metadata["original_particle_id"],
                 "global_particle_id": particle_id,
+                "size_filter_mode": size_filter_mode,
                 "n_detections": int(len(trajectory)),
+                "n_valid_spot_size_detections": n_valid_size_detections,
+                "n_detections_above_size_threshold": (
+                    n_detections_above_threshold
+                ),
+                "n_detections_after_size_filter": int(
+                    len(size_filtered_trajectory)
+                ),
                 "n_unique_frames": n_unique_frames,
                 "first_frame": first_frame,
                 "last_frame": last_frame,
                 "span_frames": span_frames,
                 "n_missing_frames": n_missing_frames,
                 "has_frame_gaps": has_frame_gaps,
-                "eligible": not (too_short or rejected_for_gaps),
+                "n_unique_frames_after_size_filter": (
+                    n_unique_frames_after_size
+                ),
+                "first_frame_after_size_filter": first_frame_after_size,
+                "last_frame_after_size_filter": last_frame_after_size,
+                "span_frames_after_size_filter": span_frames_after_size,
+                "n_missing_frames_after_size_filter": (
+                    n_missing_frames_after_size
+                ),
+                "has_frame_gaps_after_size_filter": (
+                    has_frame_gaps_after_size
+                ),
+                "passes_length_gap_filter_before_size": (
+                    passes_length_gap_filter_before_size
+                ),
+                "passes_length_gap_filter": passes_length_gap_filter,
+                "trajectory_mean_spot_fwhm_um": mean_spot_fwhm_um,
+                "maximum_trajectory_spot_fwhm_um": (
+                    maximum_trajectory_spot_fwhm_um
+                ),
+                "above_spot_size_threshold": above_size_threshold,
+                "n_size_units_above_threshold": (
+                    int(above_size_threshold)
+                    if size_filter_mode == "trajectory_mean"
+                    else n_detections_above_threshold
+                ),
+                "passes_spot_size_filter": passes_spot_size_filter,
+                "eligible": (
+                    passes_length_gap_filter
+                    and passes_length_gap_filter_before_size
+                    and passes_spot_size_filter
+                ),
                 "exclusion_reason": ";".join(reasons),
             }
         )
@@ -779,6 +1002,9 @@ def _analyze_tracking_results(
     minimum_trajectory_frames: int = 1,
     reject_trajectory_gaps: bool = False,
     channels: Sequence[int] | None = None,
+    maximum_trajectory_spot_fwhm_um: float | None = None,
+    size_filter_mode: str = "trajectory_mean",
+    measurement_channel_map: Mapping[int, int] | None = None,
     minimum_contributors_per_lag: int = 2,
     remove_drift: bool = False,
     strict: bool = True,
@@ -791,9 +1017,13 @@ def _analyze_tracking_results(
     both models. ``minimum_trajectory_frames`` rejects trajectories with fewer
     unique observed frames before MSD and spot-metric calculations. When
     ``reject_trajectory_gaps`` is true, a trajectory is also rejected if any
-    frame is missing between its first and last observation. The returned
-    dictionary contains tidy tables plus the MicroLive result objects needed
-    to render fits without recalculation.
+    frame is missing between its first and last observation. When
+    ``maximum_trajectory_spot_fwhm_um`` is provided, ``size_filter_mode``
+    selects either whole trajectories by mean matched-channel FWHM or individual
+    detections at or below that threshold. Detection mode reapplies the length
+    and gap criteria after removing oversized detections.
+    The returned dictionary contains tidy tables plus the MicroLive result
+    objects needed to render fits without recalculation.
     """
     if not np.isfinite(maximum_fit_lag_seconds) or maximum_fit_lag_seconds <= 0:
         raise ValueError("maximum_fit_lag_seconds must be positive.")
@@ -809,6 +1039,12 @@ def _analyze_tracking_results(
         raise ValueError("reject_trajectory_gaps must be a boolean.")
     if minimum_contributors_per_lag < 1:
         raise ValueError("minimum_contributors_per_lag must be at least one.")
+    size_filter_mode = _validate_size_filter_mode(size_filter_mode)
+    if maximum_trajectory_spot_fwhm_um is not None and (
+        not np.isfinite(maximum_trajectory_spot_fwhm_um)
+        or maximum_trajectory_spot_fwhm_um <= 0
+    ):
+        raise ValueError("maximum_trajectory_spot_fwhm_um must be positive.")
 
     inventory, tracking = _load_results(
         results_root,
@@ -826,11 +1062,18 @@ def _analyze_tracking_results(
     absent_globally = sorted(set(selected_channels).difference(detected_channels))
     if absent_globally:
         raise ValueError(f"Requested channels are absent: {absent_globally}.")
+    measurement_map = _resolve_measurement_channel_map(
+        selected_channels,
+        measurement_channel_map,
+    )
 
     trajectory_filter_summary = _trajectory_filter_summary(
         tracking,
         minimum_trajectory_frames=int(minimum_trajectory_frames),
         reject_trajectory_gaps=bool(reject_trajectory_gaps),
+        maximum_trajectory_spot_fwhm_um=maximum_trajectory_spot_fwhm_um,
+        measurement_channel_map=measurement_map,
+        size_filter_mode=size_filter_mode,
     )
     retained_particle_ids = set(
         trajectory_filter_summary.loc[
@@ -840,27 +1083,78 @@ def _analyze_tracking_results(
     filtered_tracking = tracking.loc[
         tracking["global_particle_id"].isin(retained_particle_ids)
     ].copy()
+    if (
+        maximum_trajectory_spot_fwhm_um is not None
+        and size_filter_mode == "detection"
+    ):
+        retained_detection_size_um = _mapped_spot_size_um(
+            filtered_tracking, measurement_map
+        )
+        filtered_tracking = filtered_tracking.loc[
+            retained_detection_size_um.notna()
+            & (
+                retained_detection_size_um
+                <= maximum_trajectory_spot_fwhm_um
+            )
+        ].copy()
     rejected_short_count = int(
         (
-            trajectory_filter_summary["n_unique_frames"]
-            < int(minimum_trajectory_frames)
+            trajectory_filter_summary["passes_spot_size_filter"]
+            & (
+                trajectory_filter_summary[
+                    "n_unique_frames_after_size_filter"
+                ]
+                < int(minimum_trajectory_frames)
+            )
         ).sum()
     )
     rejected_gap_count = int(
         (
             (
-                trajectory_filter_summary["n_unique_frames"]
+                trajectory_filter_summary["passes_spot_size_filter"]
+                & trajectory_filter_summary[
+                    "n_unique_frames_after_size_filter"
+                ]
                 >= int(minimum_trajectory_frames)
             )
-            & trajectory_filter_summary["has_frame_gaps"]
+            & trajectory_filter_summary["has_frame_gaps_after_size_filter"]
             & bool(reject_trajectory_gaps)
         ).sum()
+    )
+    rejected_size_count = int(
+        (
+            trajectory_filter_summary["passes_length_gap_filter_before_size"]
+            & ~trajectory_filter_summary["passes_spot_size_filter"]
+            & trajectory_filter_summary[
+                "trajectory_mean_spot_fwhm_um"
+            ].notna()
+        ).sum()
+    )
+    missing_size_count = int(
+        (
+            trajectory_filter_summary["passes_length_gap_filter_before_size"]
+            & (
+                trajectory_filter_summary[
+                    "n_valid_spot_size_detections"
+                ]
+                == 0
+            )
+        ).sum()
+    )
+    removed_detection_count = int(
+        trajectory_filter_summary.loc[
+            trajectory_filter_summary["passes_length_gap_filter_before_size"],
+            "n_detections_above_size_threshold",
+        ].sum()
     )
     if filtered_tracking.empty:
         raise ValueError(
             "No trajectories remain after applying trajectory acceptance: "
             f"minimum_trajectory_frames={minimum_trajectory_frames}, "
-            f"reject_trajectory_gaps={bool(reject_trajectory_gaps)}."
+            f"reject_trajectory_gaps={bool(reject_trajectory_gaps)}, "
+            "maximum_trajectory_spot_fwhm_um="
+            f"{maximum_trajectory_spot_fwhm_um}, "
+            f"size_filter_mode={size_filter_mode!r}."
         )
 
     trajectory_parts: list[pd.DataFrame] = []
@@ -902,9 +1196,7 @@ def _analyze_tracking_results(
                 cell_summary_rows.append(_empty_unit_summary(template, 0, reason))
                 continue
 
-            unit = unit.loc[
-                unit["global_particle_id"].isin(retained_particle_ids)
-            ].copy()
+            unit = unit.loc[unit.index.isin(filtered_tracking.index)].copy()
             if unit.empty:
                 template = cell.iloc[0].to_dict()
                 template["channel"] = channel
@@ -1189,6 +1481,9 @@ def _analyze_tracking_results(
         "minimum_trajectory_frames": int(minimum_trajectory_frames),
         "reject_trajectory_gaps": bool(reject_trajectory_gaps),
         "channels": selected_channels,
+        "maximum_trajectory_spot_fwhm_um": maximum_trajectory_spot_fwhm_um,
+        "size_filter_mode": size_filter_mode,
+        "measurement_channel_map": measurement_map,
         "minimum_contributors_per_lag": int(minimum_contributors_per_lag),
         "remove_drift": bool(remove_drift),
         "strict_validation": bool(strict),
@@ -1225,6 +1520,32 @@ def _analyze_tracking_results(
             print(
                 f"Rejected {rejected_gap_count} additional trajectories with "
                 "internal frame gaps."
+            )
+        if rejected_size_count:
+            if size_filter_mode == "trajectory_mean":
+                print(
+                    f"Rejected {rejected_size_count} additional trajectories "
+                    "with mean spot FWHM above "
+                    f"{maximum_trajectory_spot_fwhm_um:g} µm."
+                )
+            else:
+                trajectory_word = (
+                    "trajectory" if rejected_size_count == 1 else "trajectories"
+                )
+                print(
+                    f"Rejected {rejected_size_count} {trajectory_word} because all "
+                    "valid detections were above "
+                    f"{maximum_trajectory_spot_fwhm_um:g} µm."
+                )
+        if size_filter_mode == "detection" and removed_detection_count:
+            print(
+                f"Removed {removed_detection_count} individual detections above "
+                f"{maximum_trajectory_spot_fwhm_um:g} µm before MSD analysis."
+            )
+        if missing_size_count:
+            print(
+                f"Rejected {missing_size_count} additional trajectories without "
+                "a valid mean spot FWHM."
             )
     return analysis
 
@@ -1694,6 +2015,8 @@ def build_channel_condition_summary(
             "cell_spot_fwhm_um",
             "cell_spot_fwhm_nm",
             "n_trajectories",
+            "n_trajectories_above_size_threshold",
+            "n_size_units_above_threshold",
             "median_trajectory_frames",
         ]
         if metrics is None
@@ -1739,6 +2062,133 @@ def build_channel_condition_summary(
     return pd.DataFrame(rows)
 
 
+def _build_trajectory_size_filter_summary(
+    trajectory_filter_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """Count size-filter outcomes for each cell and tracking channel."""
+    required = {
+        "condition",
+        "source_id",
+        "local_cell_id",
+        "global_cell_id",
+        "channel",
+        "channel_condition",
+        "global_particle_id",
+        "size_filter_mode",
+        "passes_length_gap_filter_before_size",
+        "trajectory_mean_spot_fwhm_um",
+        "above_spot_size_threshold",
+        "n_valid_spot_size_detections",
+        "n_detections_above_size_threshold",
+        "n_detections_after_size_filter",
+        "n_size_units_above_threshold",
+        "passes_spot_size_filter",
+        "eligible",
+    }
+    missing = sorted(required.difference(trajectory_filter_summary.columns))
+    if missing:
+        raise ValueError(
+            "trajectory_filter_summary is missing required columns: "
+            f"{missing}."
+        )
+
+    eligible_for_size = trajectory_filter_summary.loc[
+        trajectory_filter_summary["passes_length_gap_filter_before_size"]
+    ].copy()
+    eligible_for_size["has_valid_spot_fwhm"] = np.isfinite(
+        pd.to_numeric(
+            eligible_for_size["trajectory_mean_spot_fwhm_um"],
+            errors="coerce",
+        )
+    )
+    eligible_for_size["n_detections_used_for_analysis"] = np.where(
+        eligible_for_size["eligible"],
+        eligible_for_size["n_detections_after_size_filter"],
+        0,
+    )
+    group_columns = [
+        "condition",
+        "source_id",
+        "local_cell_id",
+        "global_cell_id",
+        "channel",
+        "channel_condition",
+    ]
+    summary = (
+        eligible_for_size.groupby(group_columns, as_index=False, sort=True)
+        .agg(
+            size_filter_mode=("size_filter_mode", "first"),
+            n_trajectories_before_size_filter=(
+                "global_particle_id",
+                "nunique",
+            ),
+            n_trajectories_with_valid_spot_fwhm=(
+                "has_valid_spot_fwhm",
+                "sum",
+            ),
+            n_trajectories_above_size_threshold=(
+                "above_spot_size_threshold",
+                "sum",
+            ),
+            n_valid_spot_size_detections=(
+                "n_valid_spot_size_detections",
+                "sum",
+            ),
+            n_detections_above_size_threshold=(
+                "n_detections_above_size_threshold",
+                "sum",
+            ),
+            n_detections_after_size_filter=(
+                "n_detections_after_size_filter",
+                "sum",
+            ),
+            n_detections_used_for_analysis=(
+                "n_detections_used_for_analysis",
+                "sum",
+            ),
+            n_size_units_above_threshold=(
+                "n_size_units_above_threshold",
+                "sum",
+            ),
+            n_trajectories_after_size_filter=("eligible", "sum"),
+        )
+    )
+    count_columns = [
+        "n_trajectories_before_size_filter",
+        "n_trajectories_with_valid_spot_fwhm",
+        "n_trajectories_above_size_threshold",
+        "n_trajectories_after_size_filter",
+        "n_valid_spot_size_detections",
+        "n_detections_above_size_threshold",
+        "n_detections_after_size_filter",
+        "n_detections_used_for_analysis",
+        "n_size_units_above_threshold",
+    ]
+    summary[count_columns] = summary[count_columns].astype(int)
+    summary["n_trajectories_missing_spot_fwhm"] = (
+        summary["n_trajectories_before_size_filter"]
+        - summary["n_trajectories_with_valid_spot_fwhm"]
+    )
+    summary["percentage_trajectories_above_size_threshold"] = np.where(
+        summary["n_trajectories_with_valid_spot_fwhm"] > 0,
+        100
+        * summary["n_trajectories_above_size_threshold"]
+        / summary["n_trajectories_with_valid_spot_fwhm"],
+        np.nan,
+    )
+    size_unit_denominator = np.where(
+        summary["size_filter_mode"].eq("trajectory_mean"),
+        summary["n_trajectories_with_valid_spot_fwhm"],
+        summary["n_valid_spot_size_detections"],
+    )
+    summary["percentage_size_units_above_threshold"] = np.where(
+        size_unit_denominator > 0,
+        100 * summary["n_size_units_above_threshold"] / size_unit_denominator,
+        np.nan,
+    )
+    return summary
+
+
 def analyze_final_results(
     results_root: str | Path,
     *,
@@ -1747,6 +2197,8 @@ def analyze_final_results(
     minimum_trajectory_frames: int = 1,
     reject_trajectory_gaps: bool = False,
     channels: Sequence[int] | None = None,
+    maximum_trajectory_spot_fwhm_um: float | None = None,
+    size_filter_mode: str = "trajectory_mean",
     minimum_contributors_per_lag: int = 2,
     remove_drift: bool = False,
     channel_condition_labels: Mapping[int, str] | None = None,
@@ -1764,6 +2216,9 @@ def analyze_final_results(
         minimum_trajectory_frames=minimum_trajectory_frames,
         reject_trajectory_gaps=reject_trajectory_gaps,
         channels=channels,
+        maximum_trajectory_spot_fwhm_um=maximum_trajectory_spot_fwhm_um,
+        size_filter_mode=size_filter_mode,
+        measurement_channel_map=measurement_channel_map,
         minimum_contributors_per_lag=minimum_contributors_per_lag,
         remove_drift=remove_drift,
         strict=strict,
@@ -1799,6 +2254,9 @@ def analyze_final_results(
         measurement_channel_map=measurement_map,
         trajectory_reducer=trajectory_reducer,
         cell_reducer=cell_reducer,
+    )
+    trajectory_size_filter = _build_trajectory_size_filter_summary(
+        updated["trajectory_filter_summary"]
     )
     cell_base = updated["cell_summary"].copy()
     merge_keys = [
@@ -1846,6 +2304,36 @@ def analyze_final_results(
         validate="one_to_one",
     )
     cell_analysis = cell_analysis.merge(
+        trajectory_size_filter,
+        on=merge_keys,
+        how="left",
+        validate="one_to_one",
+    )
+    trajectory_count_columns = [
+        "n_trajectories_before_size_filter",
+        "n_trajectories_with_valid_spot_fwhm",
+        "n_trajectories_above_size_threshold",
+        "n_trajectories_after_size_filter",
+        "n_trajectories_missing_spot_fwhm",
+        "n_valid_spot_size_detections",
+        "n_detections_above_size_threshold",
+        "n_detections_after_size_filter",
+        "n_detections_used_for_analysis",
+        "n_size_units_above_threshold",
+    ]
+    cell_analysis[trajectory_count_columns] = (
+        cell_analysis[trajectory_count_columns].fillna(0).astype(int)
+    )
+    retained_count_matches = (
+        pd.to_numeric(cell_analysis["n_trajectories"], errors="coerce")
+        == cell_analysis["n_trajectories_after_size_filter"]
+    )
+    if not retained_count_matches.all():
+        raise ValueError(
+            "Retained trajectory counts disagree between the MSD analysis and "
+            "the trajectory-size filter summary."
+        )
+    cell_analysis = cell_analysis.merge(
         fit_qc,
         on=merge_keys,
         how="left",
@@ -1874,6 +2362,10 @@ def analyze_final_results(
             "experimental_condition": "tracking_channel",
             "channel_condition_labels": labels,
             "measurement_channel_map": measurement_map,
+            "maximum_trajectory_spot_fwhm_um": (
+                maximum_trajectory_spot_fwhm_um
+            ),
+            "size_filter_mode": _validate_size_filter_mode(size_filter_mode),
             "trajectory_spot_reducer": _validate_reducer(trajectory_reducer),
             "cell_spot_reducer": _validate_reducer(cell_reducer),
             "strict_validation": bool(strict),
@@ -1881,6 +2373,7 @@ def analyze_final_results(
     )
     updated["configuration"] = configuration
     updated["trajectory_spot_summary"] = trajectory_spot
+    updated["trajectory_size_filter_summary"] = trajectory_size_filter
     updated["cell_spot_summary"] = cell_spot
     updated["cell_analysis_summary"] = cell_analysis
     updated["channel_condition_summary"] = build_channel_condition_summary(
@@ -2706,7 +3199,11 @@ def _draw_cell_metric_on_ax(
 
     if log_scale:
         ax.set_yscale("log")
-    elif metric == "n_trajectories":
+    elif (
+        metric.startswith("n_trajectories")
+        or metric.startswith("n_detections")
+        or metric == "n_size_units_above_threshold"
+    ):
         ax.yaxis.set_major_locator(MaxNLocator(nbins=7, integer=True))
     elif metric == "D_um2_s":
         ax.yaxis.set_major_locator(MultipleLocator(0.01))
