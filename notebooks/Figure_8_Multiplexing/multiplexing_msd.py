@@ -19,9 +19,12 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import trackpy as tp
 from matplotlib import font_manager
+from matplotlib.collections import Collection, PathCollection
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from matplotlib.ticker import FormatStrFormatter, MaxNLocator, MultipleLocator
 from microlive import microscopy as mi
 from scipy.stats import linregress, ttest_rel, wilcoxon
@@ -1595,12 +1598,14 @@ def _publication_style(
         "font.family": "sans-serif",
         "font.sans-serif": [font_name],
         "font.size": 20,
+        "font.weight": "normal",
+        "font.style": "normal",
         "text.color": "black",
         "axes.labelsize": 26,
-        "axes.labelweight": "semibold",
+        "axes.labelweight": "normal",
         "axes.labelcolor": "black",
         "axes.titlesize": 24,
-        "axes.titleweight": "semibold",
+        "axes.titleweight": "normal",
         "axes.titlecolor": "black",
         "axes.edgecolor": "black",
         "axes.linewidth": 1.6,
@@ -1720,6 +1725,31 @@ def _add_channel_condition_column(
     return copied
 
 
+def expand_svg_font_shorthand(svg_path: str | Path) -> int:
+    """Write explicit SVG font properties while preserving editable text."""
+    pattern = re.compile(
+        r"(?<![\w-])font:\s*((?:(?:italic|oblique|normal|bold|bolder|lighter|\d{3})\s+)*)"
+        r"([\d.]+)px\s+([^;\"]+)"
+    )
+
+    def replace(match: re.Match) -> str:
+        modifiers, size, families = match.groups()
+        properties = {"font-style": "normal", "font-weight": "normal"}
+        for modifier in modifiers.split():
+            if modifier == "normal":
+                continue
+            key = "font-style" if modifier in {"italic", "oblique"} else "font-weight"
+            properties[key] = modifier
+        properties.update({"font-family": families.strip(), "font-size": f"{size}px"})
+        return "; ".join(f"{key}: {value}" for key, value in properties.items())
+
+    path = Path(svg_path)
+    rewritten, count = pattern.subn(replace, path.read_text(encoding="utf-8"))
+    if count:
+        path.write_text(rewritten, encoding="utf-8")
+    return count
+
+
 def _save_figure(
     figure: plt.Figure,
     *,
@@ -1736,19 +1766,35 @@ def _save_figure(
     figure.savefig(
         png,
         dpi=dpi,
-        bbox_inches="tight",
+        bbox_inches=None,
         facecolor="white",
         edgecolor="white",
         transparent=False,
     )
     figure.savefig(
         svg,
-        bbox_inches="tight",
+        bbox_inches=None,
         facecolor="white",
         edgecolor="white",
         transparent=False,
     )
+    expand_svg_font_shorthand(svg)
     return png, svg
+
+
+def _scale_plot_marks(figure: plt.Figure, scale: float) -> None:
+    """Keep markers and strokes proportional to the plot typography."""
+    for artist in figure.findobj():
+        if isinstance(artist, Line2D):
+            artist.set_linewidth(artist.get_linewidth() * scale)
+            artist.set_markersize(artist.get_markersize() * scale)
+            artist.set_markeredgewidth(artist.get_markeredgewidth() * scale)
+        elif isinstance(artist, Patch):
+            artist.set_linewidth(artist.get_linewidth() * scale)
+        elif isinstance(artist, Collection):
+            artist.set_linewidth(artist.get_linewidth() * scale)
+            if isinstance(artist, PathCollection):
+                artist.set_sizes(artist.get_sizes() * scale**2)
 
 
 def fit_lag_seconds_from_frames(
@@ -2981,7 +3027,7 @@ def _draw_significance_bracket(
         ha="center",
         va="bottom",
         fontsize=mpl.rcParams["font.size"],
-        fontweight="bold",
+        fontweight=mpl.rcParams["font.weight"],
         color="black",
     )
 
@@ -3046,15 +3092,11 @@ def _draw_cell_metric_on_ax(
         display_thresholds[channel] = threshold
         display_parts.append(channel_data[channel_data[metric] <= threshold])
     display_data = pd.concat(display_parts, ignore_index=False)
-    all_cells = sorted(data["global_cell_id"].unique())
-    jitter_rng = np.random.default_rng(417)
-    cell_jitter = {
-        cell: float(offset)
-        for cell, offset in zip(
-            all_cells,
-            jitter_rng.uniform(-0.14, 0.14, max(len(all_cells), 1)),
-        )
-    }
+    cell_jitter = {}
+    if connect_paired_cells:
+        all_cells = sorted(data["global_cell_id"].unique())
+        jitter_rng = np.random.default_rng(417)
+        cell_jitter = dict(zip(all_cells, jitter_rng.uniform(-0.14, 0.14, len(all_cells))))
 
     if show_trajectory_background:
         trajectory_metric = METRIC_SPECS[metric]["trajectory_metric"]
@@ -3128,27 +3170,35 @@ def _draw_cell_metric_on_ax(
                 artist.set_color("#D62728" if element == "medians" else "black")
                 artist.set_linewidth(2.8 if element == "medians" else 2.2)
 
-    for channel in channels:
-        channel_data = display_data[display_data["channel"] == channel].sort_values(
-            "global_cell_id"
-        )
-        x = np.asarray(
-            [
-                positions[channel] + cell_jitter.get(cell_id, 0.0)
-                for cell_id in channel_data["global_cell_id"]
-            ],
-            dtype=float,
-        )
-        ax.scatter(
-            x,
-            channel_data[metric],
-            s=34,
-            marker="o",
+    if connect_paired_cells:
+        for channel in channels:
+            channel_data = display_data[display_data["channel"] == channel].sort_values(
+                "global_cell_id"
+            )
+            x = positions[channel] + channel_data["global_cell_id"].map(cell_jitter)
+            ax.scatter(
+                x,
+                channel_data[metric],
+                s=34,
+                marker="o",
+                color="black",
+                edgecolor="black",
+                linewidth=0.35,
+                alpha=0.95,
+                zorder=3,
+            )
+    else:
+        sns.swarmplot(
+            x=display_data["channel"].map(positions),
+            y=display_data[metric],
+            native_scale=True,
             color="black",
+            size=np.sqrt(34),
             edgecolor="black",
             linewidth=0.35,
             alpha=0.95,
             zorder=3,
+            ax=ax,
         )
 
     summary = _metric_summary(
@@ -3212,7 +3262,7 @@ def _draw_cell_metric_on_ax(
         ax.yaxis.set_major_locator(MaxNLocator(nbins=7, min_n_ticks=5))
     ax.set_xticks(
         [positions[channel] for channel in channels],
-        [labels[channel] for channel in channels],
+        [labels[channel].replace(r"$\Delta$", "Δ") for channel in channels],
     )
     ax.set_ylabel(METRIC_SPECS[metric]["label"])
     ax.set_title(METRIC_SPECS[metric]["title"], pad=13)
@@ -3230,7 +3280,7 @@ def _draw_cell_metric_on_ax(
     for tick_label in [*ax.get_xticklabels(), *ax.get_yticklabels()]:
         tick_label.set_fontfamily(font_family)
         tick_label.set_color("black")
-        tick_label.set_fontweight("semibold")
+        tick_label.set_fontweight(mpl.rcParams["font.weight"])
     if show_sample_counts:
         for row in summary.itertuples(index=False):
             hidden = int(row.n_cells_above_display_percentile)
@@ -3409,6 +3459,7 @@ def plot_cell_metric(
             ax.set_title("")
         if ylabel is not None:
             ax.set_ylabel(str(ylabel))
+        _scale_plot_marks(fig, min(1.0, mpl.rcParams["font.size"] / 20.0))
         if output_directory is not None:
             _save_figure(
                 fig,
@@ -3444,7 +3495,10 @@ def _draw_channel_msd_on_ax(
     fit_summary = msd_result["fit_summary"]
     configuration = msd_result["configuration"]
     channels = [int(value) for value in configuration["channels"]]
-    labels = configuration["channel_condition_labels"]
+    labels = {
+        channel: label.replace(r"$\Delta$", "Δ")
+        for channel, label in configuration["channel_condition_labels"].items()
+    }
     encodings = _channel_encoding(channels)
     uncertainty = configuration["uncertainty"]
     center = configuration["center"]
@@ -3587,7 +3641,7 @@ def _draw_channel_msd_on_ax(
                     legend_labels.append(f"{labels[channel]}: {summary_label}")
 
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel(r"MSD ($\mu$m$^2$)")
+    ax.set_ylabel("MSD (µm²)")
     ax.set_title(f"{center.title()} MSD across paired cell samples", pad=13)
     ax.set_facecolor("white")
     ax.grid(False, which="both")
@@ -3734,6 +3788,7 @@ def plot_channel_msd(
                 frameon=False,
                 fontsize=leg_fs,
             )
+        _scale_plot_marks(fig, min(1.0, mpl.rcParams["font.size"] / 20.0))
         if output_directory is not None:
             config = msd_result["configuration"]
             _save_figure(
