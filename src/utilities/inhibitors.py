@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+"""Analysis and plotting functions for inhibitor time courses in the UTag assays."""
+
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -7,16 +8,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from scipy.optimize import curve_fit
 from scipy.stats import mannwhitneyu
-
-current_dir = Path().resolve()
-from microlive.imports import *
-from microlive import microscopy as mi
-import tasep_models as tm
-from tasep_models import *
+from tasep_models import (
+    GFP_TAG, HA_TAG, calculate_codon_elongation_rates, create_probe_vector,
+    read_gene_sequence_return_probes, read_sequence, simulate_TASEP_SSA,
+)
 
 
-plt.rcParams.update({
+def configure_plot_style():
+    """Apply the MicroLive ggplot base and the UTag assay figure settings."""
+    plt.style.use('ggplot')
+    plt.rcParams.update({
         'figure.facecolor': 'white',
         'axes.facecolor': 'white',
         'axes.edgecolor': 'black',
@@ -330,7 +333,7 @@ def load_particle_counts_by_experiment(
 
 
 def calculate_intensity(particle_counts_per_frame, sum_intensities_per_frame, inhibitor_frame_index, normalization_method='mean', percentile_range=(5, 95)):
-    """Normalize the intensity per frame.
+    """Calculate per-frame intensity, optionally relative to the pre-treatment mean.
 
     For frames before the treatment, each frame's intensity is given by
     sum_intensities / particle_counts. If the particle count is zero in a frame,
@@ -344,12 +347,11 @@ def calculate_intensity(particle_counts_per_frame, sum_intensities_per_frame, in
         particle_counts_per_frame: 1D array of particle counts per frame.
         sum_intensities_per_frame: 1D array of sum intensities per frame.
         inhibitor_frame_index: The frame index at which treatment starts.
-        normalization_method: 'mean' (default) divides by pre-treatment mean,
-            'minmax' scales the trajectory to [0, 1] range,
-            'percentile' scales using percentile bounds (robust to outliers).
-            None: no normalization.
-        percentile_range: Percentile bounds for 'percentile' method.
-            Default (5, 95). Use (1, 99) for wider range.
+        normalization_method: 'mean' scales this cell's trajectory. None,
+            'minmax', and 'percentile' return its unscaled intensities here;
+            process_inhibitor_data applies any pooled scaling.
+        percentile_range: Retained for compatibility. Pooled percentile bounds
+            are set in process_inhibitor_data, not in this per-cell function.
 
     Returns:
         Tuple of (normalized_intensities, raw_avg_intensities, avg_particles_before_treatment).
@@ -466,10 +468,7 @@ def fit_inhibitor_model(x_data, y_data, err_data=None, model='exponential',
     y_fit = y_fit[valid]
     if err_fit is not None:
         err_fit = err_fit[valid]
-        # Replace zero uncertainties with a small fraction of the minimum
-        # non-zero value. When ALL uncertainties are zero (identical replicates
-        # at every time point — cannot happen with real multi-cell data), this
-        # falls back to a fixed 1e-10 so curve_fit still converges.
+        # Give zero-error points a finite weight in the fit.
         err_fit = np.where(err_fit == 0, np.min(err_fit[err_fit > 0]) * 0.1 if np.any(err_fit > 0) else 1e-10, err_fit)
         sigma_kwarg = {'sigma': err_fit, 'absolute_sigma': True}
     else:
@@ -507,7 +506,6 @@ def fit_inhibitor_model(x_data, y_data, err_data=None, model='exponential',
 
         elif model == 'exponential':
             # y = A * exp(-x/τ) + C
-            # Initial guesses (robust to negative/positive baselines)
             tail = max(1, len(y_fit) // 5)
             C0 = max(float(np.mean(y_fit[-tail:])), 0.0)  # nonnegative baseline
             A0 = max(float(y_fit[0]) - C0, 1e-8)
@@ -515,9 +513,7 @@ def fit_inhibitor_model(x_data, y_data, err_data=None, model='exponential',
             popt, pcov = curve_fit(
                 _exponential_model, x_fit, y_fit,
                 p0=[A0, tau0, C0],
-                # Normalized spot counts cannot have a negative plateau.
-                # Constraining C prevents a poorly identified slow decay
-                # from producing negative half-levels and enormous half-lives.
+                # The fitted plateau cannot be negative for normalized spot counts.
                 bounds=([0, 1e-6, 0], [np.inf, np.inf, np.inf]),
                 maxfev=50000,
                 **sigma_kwarg,
@@ -536,11 +532,10 @@ def fit_inhibitor_model(x_data, y_data, err_data=None, model='exponential',
 
         elif model == 'heaviside':
             # y = A * (1 - x/T) * H(T - x) + C   (Larson 2011)
-            # Initial guesses (robust to negative/positive baselines)
             tail = max(1, len(y_fit) // 5)
             C0 = float(np.mean(y_fit[-tail:]))           # baseline from last 20%
             A0 = max(float(y_fit[0]) - C0, 1e-8)         # amplitude above baseline
-            # Smart T guess: find where data first drops to baseline level
+            # Initialize T at the first crossing of the estimated baseline.
             crossings = np.where(y_fit <= C0)[0]
             if len(crossings) > 0:
                 T0 = float(x_fit[crossings[0]] - x_fit[0])
@@ -769,7 +764,7 @@ def plot_inhibitor(full_frames, intensities_normalized, inhibitor_frame_index,
         colors = [colors]
 
     if results_folder is None:
-        results_folder = current_dir / 'results_HT'
+        results_folder = Path.cwd() / 'results_HT'
         results_folder.mkdir(exist_ok=True)
 
     if intensities_normalized is None or len(intensities_normalized) == 0:
@@ -1248,7 +1243,7 @@ def plot_multiple_inhibitors(full_frames_list,
     """
     # Prepare output folder
     if results_folder is None:
-        results_folder = current_dir / 'results_HT'
+        results_folder = Path.cwd() / 'results_HT'
     results_folder.mkdir(parents=True, exist_ok=True)
 
     time_unit = str(time_unit).strip().lower()
@@ -2009,6 +2004,7 @@ def calculate_actd_cell_half_times(
                 params = fit_result['params']
                 tau_min = float(params['tau (time constant)'])
                 plateau = float(params['C (baseline)'])
+                # Anchor the half-time calculation to the observed count, not the fitted intercept.
                 initial_signal = float(y_data[start])
                 initial_component = initial_signal - plateau
                 target_component = half_life_target - plateau
@@ -2119,7 +2115,7 @@ def plot_cell_half_times_box_swarm(
     ax.tick_params(axis='x', labelsize=tick_size, colors='black')
     ax.tick_params(axis='y', labelsize=tick_size, colors='black')
     if condition_display_labels is not None:
-        ax.set_xticklabels([
+        ax.set_xticks(range(len(condition_order)), labels=[
             condition_display_labels.get(condition, condition)
             for condition in condition_order
         ])
@@ -2385,6 +2381,21 @@ def plot_actd_spot_counts(
     )
 
 
+def load_real_tracking_dataframes(results_dir, substring_in_data_dir=''):
+    """Read one tracking CSV per matching results_* folder in stable cell order."""
+    dataframes = []
+    for folder in sorted(Path(results_dir).glob('results_*')):
+        if not folder.is_dir() or substring_in_data_dir not in folder.name:
+            continue
+        files = [p for p in folder.glob('tracking_*') if p.is_file() and p.suffix.lower() == '.csv']
+        if len(files) != 1:
+            raise ValueError(f'Expected exactly one tracking CSV in {folder}; found {len(files)}.')
+        dataframes.append(pd.read_csv(files[0]))
+    if not dataframes:
+        raise ValueError(f'No matching results_* folders in {results_dir} (filter: {substring_in_data_dir!r}).')
+    return dataframes
+
+
 def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_dir='', selected_field='spot_int_ch_0', use_sem=True, show_summary=True, max_percentage_threshold_after_treatment=None,
                      frame_interval_sec=60, simulation_dna_sequence=None, inhibitor_delay_time_seconds=60, list_tag_sequences=None, ki_simulation=0.04, ke_simulation=4.5,
                      normalization_method='mean', percentile_range=(5, 95), verbose=False,
@@ -2410,10 +2421,10 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
         list_tag_sequences: Tag sequences for probe detection.
         ki_simulation: Initiation rate for simulation.
         ke_simulation: Elongation rate for simulation.
-        normalization_method: 'mean' (default) divides by pre-treatment mean
-            intensity (values start ~1.0). 'minmax' scales each cell's
-            trajectory to [0, 1] range. 'percentile' scales using percentile
-            bounds (robust to outliers). None: no normalization.
+        normalization_method: 'mean' divides each cell's intensities by its
+            pre-treatment mean. 'minmax' and 'percentile' pool bounds across
+            cells and frames. None leaves intensities unscaled. Spot counts
+            are always normalized to each cell's pre-treatment mean.
         percentile_range: Percentile bounds for 'percentile' method.
             Default (5, 95). Use (1, 99) for wider range.
         verbose: If True, print processing details and summary statistics.
@@ -2430,43 +2441,12 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
         time_array_sim_min, mean_intensity_ssa_inh, err_intensity_ssa_inh).
     """
 
-    list_dataframes = []
-    subfolders = sorted(
-        folder for folder in data_dir.iterdir()
-        if (folder.is_dir()
-            and folder.name.startswith('results_')
-            and substring_in_data_dir in folder.name)
-    )
-    if verbose:
-        print('List of processed dataframes:')
-    for subfolder in subfolders:
-        files = sorted(
-            f for f in subfolder.iterdir()
-            if (f.is_file()
-                and f.name.startswith('tracking_')
-                and not f.name.startswith('._')
-                and f.suffix.lower() == '.csv')
-        )
-        if len(files) != 1:
-            raise ValueError(
-                f'{subfolder.name} must contain exactly one real tracking_*.csv '
-                f'file after excluding AppleDouble sidecars; found {len(files)}.'
-            )
-        dfs = pd.read_csv(files[0])
-        list_dataframes.append(dfs)
-        if verbose:
-            print('subfolder:', subfolder)
-
-    # detect the maximum frame number across all dataframes
-    max_frame = 0
-    for df in list_dataframes:
-        max_frame = max(max_frame, df['frame'].max())
-
-    # terminate the program if the maximum frame is less than 1
+    list_dataframes = load_real_tracking_dataframes(data_dir, substring_in_data_dir)
+    max_frame = max((df['frame'].max() for df in list_dataframes if not df.empty), default=-1)
     if max_frame < 10:
-        if verbose:
-            print('No dataframes found with frame number greater than 10 frames.')
-        return None, None, None, None, None, None, None, None
+        raise ValueError(f'Tracking data must reach frame 10; last frame was {max_frame}.')
+    if not 0 < inhibitor_frame_index <= max_frame:
+        raise ValueError('Treatment must have at least one pre-treatment frame and lie within the recording.')
 
     # frame_indices includes max_frame so that reindex() covers every
     # observed frame (0 through max_frame inclusive).  The returned
@@ -2474,7 +2454,6 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
     # frame_indices, keeping them aligned.
     frame_indices = np.arange(0, max_frame + 1)
     array_particles = np.zeros((len(list_dataframes), len(frame_indices)))
-    average_intensity = np.zeros((len(list_dataframes), len(frame_indices)))
     intensities_normalized = np.zeros((len(list_dataframes), len(frame_indices)))
     average_molecules_before_treatment = np.zeros(len(list_dataframes))
     for i, df in enumerate(list_dataframes):
@@ -2484,20 +2463,13 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
         # Re-index to include frames with no particles (fill missing with 0)
         particle_counts_per_frame = particle_counts_per_frame.reindex(frame_indices, fill_value=0).values
         sum_intensities_per_frame = sum_intensities_per_frame.reindex(frame_indices, fill_value=0).values
-        # Ensure the lengths match frame_indices
-        if len(particle_counts_per_frame) > len(frame_indices):
-            particle_counts_per_frame = particle_counts_per_frame[:len(frame_indices)]
-            sum_intensities_per_frame = sum_intensities_per_frame[:len(frame_indices)]
-        # Compute raw intensities (always use 'mean' per-cell first)
-        intensities_normalized_before_treatment_intensity, average_intensity_with_respect_number_particles, average_particles_before_treatment = calculate_intensity(
+        cell_intensities, _, average_particles_before_treatment = calculate_intensity(
             particle_counts_per_frame, sum_intensities_per_frame, inhibitor_frame_index,
             normalization_method=normalization_method
         )
-        # Store in array
         normalized_particles, _ = calculate_number_of_particles_per_frame(particle_counts_per_frame, inhibitor_frame_index)
         array_particles[i] = normalized_particles
-        average_intensity[i] = average_intensity_with_respect_number_particles
-        intensities_normalized[i] = intensities_normalized_before_treatment_intensity
+        intensities_normalized[i] = cell_intensities
         average_molecules_before_treatment[i] = average_particles_before_treatment
 
     # Apply global normalization across all cells (after the loop)
@@ -2545,10 +2517,8 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
             else:
                 responding_indices.append(i)
     else:
-        # print a warning if the threshold is not provided
         if verbose:
             print('Warning: No threshold provided. All trajectories are considered responding.')
-        # if no threshold is provided, all trajectories are considered responding
         responding_indices = list(range(len(intensities_normalized)))
         non_responding_indices = []
 
@@ -2558,16 +2528,12 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
         print(f'{"─" * 40}')
         print('\nCells')
         print(f'{"─" * 40}')
-        # report total cells
         total_cells = len(intensities_normalized)
         print('total_cells: ', total_cells)
         number_of_responding_cells = len(responding_indices)
         print('number_of_responding_cells: ', number_of_responding_cells)
         number_of_non_responding_cells = len(non_responding_indices)
         print('number_of_non_responding_cells: ', number_of_non_responding_cells)
-        # Denominator equals total_cells (every trajectory is classified as
-        # responding or non-responding), which is guaranteed > 0 here because
-        # the function returns early when max_frame < 10.
         percentage_non_responding_cells = number_of_non_responding_cells / total_cells * 100
         print('percentage_non_responding_cells: ', np.round(percentage_non_responding_cells,1))
         print(f'\nRNA\n{"─" * 40}')
@@ -2591,15 +2557,10 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
         t_max = max_frame * frame_interval_sec  # Total experiment time in seconds
         step_size_in_sec = 1
         time_array = np.arange(0, t_max, step_size_in_sec)
-        _, rna, gene_length, first_probe_position_vector, second_probe_position_vector = read_gene_sequence_return_probes(simulation_dna_sequence, min_protein_length=50, list_tag_sequences=list_tag_sequences)
+        _, rna, gene_length, first_probe_position_vector, _ = read_gene_sequence_return_probes(simulation_dna_sequence, min_protein_length=50, list_tag_sequences=list_tag_sequences)
         ke = calculate_codon_elongation_rates(rna, global_elongation_rate=list_simulation_parameters[1])
         time_perturbation_application = inhibitor_frame_index * frame_interval_sec + inhibitor_delay_time_seconds
         evaluating_inhibitor = 1
-        # inhibitor_effectiveness=95: percentage reduction in initiation rate
-        # upon drug application.  The 95% value is specific to the
-        # translational-inhibitor run-off assay modeled here (see Tanenbaum
-        # et al. 2015).  The optimization/Harringtonine validation uses 90%
-        # in a different experimental context.
         ssa_array = simulate_TASEP_SSA(list_simulation_parameters[0],
                                     ke,
                                     gene_length,
@@ -2617,7 +2578,6 @@ def process_inhibitor_data(data_dir, inhibitor_frame_index, substring_in_data_di
         downsample_factor = int(frame_interval_sec)  # e.g., 60 for 1 min, 20 for 20 sec
         time_array_downsampled = time_array[::downsample_factor]
         ssa_array_downsampled = ssa_array[:, ::downsample_factor]
-        # plotting
         time_array_sim_min = time_array_downsampled/60
         normalized_data = np.zeros_like(ssa_array_downsampled)
         for i in range(ssa_array_downsampled.shape[0]):
@@ -2645,8 +2605,7 @@ def simulate_inhibitor(gene_sequence, ki=0.04, ke_global=5, use_sem=False, max_f
                        verbose=False):
     """Run a TASEP simulation for a gene sequence with inhibitor treatment.
 
-    Simulation-only function (no experimental data). Uses codon-usage-aware
-    elongation rates and supports multi-tag probe detection.
+    Simulates the intensity of the first tag with codon-specific elongation rates.
 
     Args:
         gene_sequence: DNA sequence to simulate.
@@ -2675,22 +2634,11 @@ def simulate_inhibitor(gene_sequence, ki=0.04, ke_global=5, use_sem=False, max_f
     tag_positions_first_probe_vector = indexes_tags[0]
     first_probe_position_vector = create_probe_vector(tag_positions_first_probe_vector, gene_length)
 
-    # second probe vector.
-    tag_positions_second_probe_vector = indexes_tags[1]
-    second_probe_position_vector = create_probe_vector(tag_positions_second_probe_vector, gene_length)
-
     if verbose:
         print(f"First probe positions: {tag_positions_first_probe_vector}")
-        print(f"Second probe positions: {tag_positions_second_probe_vector}")
 
     ke_codon_dependent = calculate_codon_elongation_rates(rna, global_elongation_rate=ke_global)
 
-    full_frames = np.arange(0, max_frame)
-    full_frames = full_frames - inhibitor_frame
-
-    # This function assumes 1-minute frame intervals by design (see docstring:
-    # "max_frame: Maximum number of frames (minutes)").  For non-60-second
-    # intervals, use process_inhibitor_data which accepts frame_interval_sec.
     number_repetitions = 100
     burnin_time = 2000
     t_max = max_frame * 60
@@ -2714,7 +2662,6 @@ def simulate_inhibitor(gene_sequence, ki=0.04, ke_global=5, use_sem=False, max_f
     # downsample time array and simulation output to 1 minute resolution.
     time_array_downsampled = time_array[::60]
     ssa_array_downsampled = ssa_array[:, ::60]
-    # plotting
     time_array_min = time_array_downsampled / 60
     normalized_data = np.zeros_like(ssa_array_downsampled)
     for i in range(ssa_array_downsampled.shape[0]):

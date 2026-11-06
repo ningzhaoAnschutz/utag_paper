@@ -25,6 +25,8 @@ utag_paper/
 │   ├── Figure_6/                     # Linker optimization, localization, gene maps
 │   ├── Figure_7/                     # ACF, spot properties, Harringtonine chase
 │   ├── Figure_S2_ITC/                # ITC binding affinity (in vitro)
+│   ├── Figure_S7E_F_RNA_stability/   # ActD time courses and per-cell half-times
+│   ├── Figure_S9A_puromycin/         # Puromycin spot runoff
 │   └── Figure_Sup_SSA/               # Supplementary TASEP simulations
 │
 ├── optimization/                     # TASEP parameter optimization (grid search)
@@ -33,12 +35,14 @@ utag_paper/
 │   ├── runner*.sh                    # Cluster submission scripts (4 datasets)
 │   └── results_ACF/                  # Experimental ACF data and output CSVs
 │
-├── gene_sequences/                   # Plasmid DNA sequences (.dna, ~20 constructs)
-│   └── utag_project/                 # UTag, SunTag, ALFAtag reporter constructs
+├── gene_sequences/
+│   └── utag_project/                 # Reporter inputs: pNZ208 (UTag), pNZ266 (SunTag), pNZ267 (ALFA)
+├── kk_old_gene_sequences/            # Local archive of the original sequence folder (not tracked by Git)
 │
 ├── src/                              # Shared project utilities
 │   ├── imports.py                    # Shared imports, paths, and colormaps
 │   └── utilities/
+│       ├── inhibitors.py             # HT tracking-data loading; analysis for S7E-F and S9A
 │       └── extract_laser_intensities.py  # LIF laser metadata extraction
 ├── environment.yml                   # Conda environment specification
 ├── LICENSE                           # BSD 3-Clause
@@ -95,6 +99,8 @@ utag_paper/
 | Notebook | Content |
 |----------|---------|
 | `Figure_S2_ITC/extracting_metadata_itc.ipynb` | Isothermal Titration Calorimetry — KD, ΔH, stoichiometry |
+| `Figure_S7E_F_RNA_stability/Figure_S7E_F_RNA_stability.ipynb` | ActD time courses (S7E) and per-cell mRNA half-times (S7F) |
+| `Figure_S9A_puromycin/Figure_S9A_puromycin.ipynb` | Translation spot counts after puromycin treatment (S9A) |
 | `Figure_Sup_SSA/Modeling_TASEP.ipynb` | Stochastic TASEP simulations, simulated ACF, parameter recovery |
 
 ---
@@ -146,6 +152,8 @@ Each directory is subdivided by tagging system (UTag, UTag_CF, SunTag, AlfaTag) 
 ---
 
 ## Reproducing Figures
+
+The Figure 7 HT notebooks and S9A use the same tracking CSV loader in `src/utilities/inhibitors.py`. The published 7J-M linear fits are computed in `Figure_7_J_K_L_M__HT_linear_fit.ipynb`, not by the utility's generic fit routine. S7E-F and S9A use the utility for analysis and plotting; each still reads its own local inputs and writes to its own `figures/` and `raw_data/`. Run these notebooks within this repository using the `microlive` kernel.
 
 1. Activate the `microlive` conda environment.
 2. Download microscopy data from [Zenodo](https://doi.org/10.5281/zenodo.19925202) and place it in the expected data directory.
