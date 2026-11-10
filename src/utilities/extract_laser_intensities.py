@@ -1,10 +1,4 @@
-"""
-Shared Utility: Extract Laser Intensities from LIF Files
-
-This module provides the core extraction logic (extract_laser_intensities) 
-for scanning LIF properties and saving laser metadata into pandas DataFrames.
-It wraps microlive.microscopy.ReadLif.
-"""
+"""Extract active-laser intensities and detection ranges from Leica LIF files."""
 
 from pathlib import Path
 import pandas as pd
@@ -12,7 +6,6 @@ from microlive import microscopy as mi
 
 
 
-# ── Core extraction function ──────────────────────────────────────────────────
 def extract_laser_intensities(folder_with_lif_files, verbose=False):
     """
     Extract laser intensities and wave ranges from all LIF files in a folder.
@@ -38,7 +31,6 @@ def extract_laser_intensities(folder_with_lif_files, verbose=False):
     if isinstance(folder_with_lif_files, str):
         folder_with_lif_files = Path(folder_with_lif_files)
 
-    # Find all LIF files
     files = sorted(
         f for f in folder_with_lif_files.iterdir()
         if f.is_file() and f.suffix.lower() == ".lif"
@@ -51,7 +43,6 @@ def extract_laser_intensities(folder_with_lif_files, verbose=False):
         print(f"  Processing: {lif_file.name}", end="")
 
         try:
-            # Read LIF file metadata via MicroLive
             (
                 list_images,
                 list_names,
@@ -74,7 +65,6 @@ def extract_laser_intensities(folder_with_lif_files, verbose=False):
 
             print(f" ({len(list_names)} images)")
 
-            # Extract data for each image in the LIF container
             for i, image_name in enumerate(list_names):
                 laser_lines = list_laser_lines[i] if list_laser_lines else []
                 intensities = list_intensities[i] if list_intensities else []
@@ -85,7 +75,7 @@ def extract_laser_intensities(folder_with_lif_files, verbose=False):
                     "Image Name": image_name,
                 }
 
-                # Only add columns for USED lasers (intensity > 0)
+                # Omit lasers with zero intensity.
                 used_lasers = []
                 for ch_idx in range(len(laser_lines)):
                     intensity = (
@@ -121,7 +111,6 @@ def extract_laser_intensities(folder_with_lif_files, verbose=False):
                 traceback.print_exc()
             continue
 
-    # Build DataFrame
     df = pd.DataFrame(all_data)
 
     if df.empty:

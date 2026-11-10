@@ -26,6 +26,7 @@ mask_*
 tests/
 results/
 /results/
+results*/
 test*/
 test*
 filtered_images_*/
@@ -46,8 +47,46 @@ spatio_temporal_models/
 *particle*.png
 dev/
 *.cds.all.fa
-optimization/
 optimization_new/
 UTag paper writing/
 .agent/
 manuscript/
+ITC_processing_final/
+revision_paper/
+sec_*
+export_files/
+
+# Keep simulations, logs and generated plots local. Publish only these ACF files.
+optimization/
+!/optimization/
+/optimization/*
+!/optimization/optimization.py
+!/optimization/plotting_optimization.ipynb
+!/optimization/runner_mac.sh
+!/optimization/RUNNING_OPTIMIZATION_ON_MAC.md
+
+# Experimental inputs and retained cell/trajectory counts for Figure 7.
+!/optimization/source_files_ACF/
+/optimization/source_files_ACF/*
+!/optimization/source_files_ACF/data_ACF/
+/optimization/source_files_ACF/data_ACF/*
+!/optimization/source_files_ACF/data_ACF/df_ACF_utag.csv
+!/optimization/source_files_ACF/data_ACF/report_cells_trajectories_ACF_utag.txt
+!/optimization/source_files_ACF/data_ACF/df_ACF_utag_c_free.csv
+!/optimization/source_files_ACF/data_ACF/report_cells_trajectories_ACF_utag_c_free.txt
+!/optimization/source_files_ACF/data_ACF/df_ACF_suntag.csv
+!/optimization/source_files_ACF/data_ACF/report_cells_trajectories_ACF_suntag.txt
+!/optimization/source_files_ACF/data_ACF/df_ACF_alfatag.csv
+!/optimization/source_files_ACF/data_ACF/report_cells_trajectories_ACF_alfatag.txt
+
+# Frozen grids for Figure S11 and full-precision estimates for Figure 7/Table S7.
+!/optimization/results_ACF/
+/optimization/results_ACF/*
+!/optimization/results_ACF/results_df_utag.csv
+!/optimization/results_ACF/optimized_params_utag.csv
+!/optimization/results_ACF/results_df_utag_c_free.csv
+!/optimization/results_ACF/optimized_params_utag_c_free.csv
+!/optimization/results_ACF/results_df_suntag.csv
+!/optimization/results_ACF/optimized_params_suntag.csv
+!/optimization/results_ACF/results_df_alfatag.csv
+!/optimization/results_ACF/optimized_params_alfatag.csv

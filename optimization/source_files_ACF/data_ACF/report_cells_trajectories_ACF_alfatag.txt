@@ -1,0 +1,3 @@
+Total number of cells: 11
+Total number of spots: 187
+Number of trajectories after filtering based on quality: 155
